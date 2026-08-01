@@ -3,15 +3,19 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>szl-provctl-live — provenance-DAG verify hologram</title>
-<meta name="description" content="Live in-browser re-verification of a real szl-provctl provenance DAG (in-toto v1 / SLSA v1). Every SHA3-256 digest re-hashed in YOUR browser."/>
+<title>szl-provctl-live — sample provenance-DAG verifier</title>
+<meta name="description" content="In-browser re-verification of a kernel-generated SAMPLE szl-provctl provenance DAG. Every SHA3-256 digest is re-hashed locally; this is not a live production run."/>
 <style>
 :root{--c:#3af4c8;--dim:#1b8f78;--bg:#000;--panel:#04100d;--warn:#ffb454;--bad:#ff5c6c;--ok:#3af4c8;--txt:#bfeee2;}
 *{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:20px}
 html,body{margin:0;background:var(--bg);color:var(--txt);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.5}
 a{color:var(--c);text-decoration:none;border-bottom:1px dotted var(--dim)}
 a:hover{color:#fff}
-.wrap{max-width:1000px;margin:0 auto;padding:28px 18px 80px}
+a:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid var(--c);outline-offset:4px}
+.skip{position:fixed;z-index:20;top:max(8px,env(safe-area-inset-top));left:max(8px,env(safe-area-inset-left));padding:10px 13px;background:var(--c);color:var(--bg);transform:translateY(-180%);transition:transform .2s}
+.skip:focus{transform:none}
+.wrap{max-width:1000px;margin:0 auto;padding:max(28px,env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) max(80px,env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left))}
 .glow{text-shadow:0 0 8px rgba(58,244,200,.55)}
 h1{font-size:clamp(22px,4vw,34px);margin:.2em 0;color:var(--c)}
 h2{color:var(--c);font-size:18px;border-bottom:1px solid rgba(58,244,200,.18);padding-bottom:6px;margin-top:34px}
@@ -30,38 +34,66 @@ h2{color:var(--c);font-size:18px;border-bottom:1px solid rgba(58,244,200,.18);pa
 .hash{color:var(--dim);word-break:break-all;font-size:11.5px}
 .hash b{color:var(--txt)}
 pre{background:var(--panel);border:1px solid rgba(58,244,200,.14);border-radius:5px;padding:12px;overflow:auto;font-size:11.5px;color:#9fe6d3}
-.controls{margin:10px 0 4px}
-button{background:transparent;color:var(--c);border:1px solid var(--dim);border-radius:4px;padding:7px 13px;font-family:inherit;cursor:pointer;font-size:13px}
+.controls{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 4px}
+button{min-height:44px;background:transparent;color:var(--c);border:1px solid var(--dim);border-radius:4px;padding:7px 13px;font-family:inherit;cursor:pointer;font-size:13px}
 button:hover{border-color:var(--c);box-shadow:0 0 10px rgba(58,244,200,.25)}
 .foot{margin-top:40px;color:var(--dim);font-size:11.5px;border-top:1px solid rgba(58,244,200,.15);padding-top:14px}
 .kv{color:var(--dim)} .kv b{color:var(--txt)}
 .status-line{font-size:14px;margin:10px 0}
 .pill{font-size:11px;color:var(--dim)}
 details summary{cursor:pointer;color:var(--c)}
+.identity{display:grid;grid-template-columns:1.1fr .9fr;gap:12px;margin:20px 0}
+.identity>div,.path{border:1px solid rgba(58,244,200,.22);border-radius:6px;padding:14px 16px;background:var(--panel)}
+.identity h2,.path h2{margin:0 0 7px;padding:0;border:0;font-size:14px}
+.identity p,.path p{margin:0;color:var(--txt);font-size:12px}
+.identity dl{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;margin:0;font-size:11px}
+.identity dt{color:var(--dim)}.identity dd{margin:0;color:#fff;overflow-wrap:anywhere}
+.paths{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:24px 0}
+.path a{display:inline-flex;align-items:center;min-height:44px;margin-top:8px}
+@media(max-width:640px){.identity,.paths{grid-template-columns:1fr}.controls button{width:100%}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.skip{transition:none}}
 </style>
 </head>
 <body>
+<a class="skip" href="#evidence">Skip to evidence identity</a>
 <div class="wrap">
   <h1 class="glow">szl-provctl-live</h1>
-  <div class="sub">provenance-DAG verify hologram · in-toto Statement v1 + SLSA provenance v1 · every SHA3-256 digest re-hashed in <b>YOUR</b> browser</div>
+  <div class="sub">SAMPLE provenance-DAG verifier · in-toto Statement v1 + SLSA provenance v1 · every SHA3-256 digest re-hashed in <b>YOUR</b> browser</div>
+  <div><span class="badge warn">SAMPLE ARTIFACT</span><span class="badge ok">LOCAL INTEGRITY CHECK</span><span class="badge">NOT A LIVE PRODUCTION RUN</span></div>
 
-  <div class="status-line" id="verdict"><span class="badge warn">verifying…</span></div>
+  <div class="status-line" id="verdict" role="status" aria-live="polite"><span class="badge warn">verifying sample…</span></div>
 
   <p class="sub">
-    The sample below is a <b>real</b> provenance DAG produced by the canonical
+    The fixture below is a <b>kernel-generated SAMPLE</b> provenance DAG produced by the canonical
     <a href="https://huggingface.co/SZLHOLDINGS/szl-provctl" target="_blank" rel="noopener">SZLHOLDINGS/szl-provctl</a>
     kernel (chain source shown in footer). Nothing here is fabricated: this page independently re-computes
     the SHA3-256 hash-chain of every receipt with a vendored, pinned
     <a href="https://github.com/emn178/js-sha3" target="_blank" rel="noopener">js-sha3 0.8.0 (MIT)</a>
-    and re-checks every DAG edge. Labels: <span class="badge ok">MEASURED-in-your-browser</span> = re-hashed here now ·
-    <span class="badge">REPORTED</span> = as emitted by the kernel.
+    and re-checks every DAG edge. It is not a live customer or production run. Labels:
+    <span class="badge ok">MEASURED-in-your-browser</span> = re-hashed here now ·
+    <span class="badge">REPORTED SAMPLE</span> = as emitted by the kernel fixture.
   </p>
 
+  <section class="identity" id="evidence" aria-label="Evidence identity and provenance">
+    <div><h2>Evidence identity</h2><p>Local SHA3-256 recomputation measures fixture integrity and edge consistency. It does not establish authorship, production execution, or truth of the modeled run.</p></div>
+    <div><dl>
+      <dt>artifact</dt><dd>embedded kernel-generated SAMPLE</dd>
+      <dt>format</dt><dd>in-toto v1 + SLSA provenance v1</dd>
+      <dt>measurement</dt><dd>local digest and edge recomputation</dd>
+      <dt>energy</dt><dd>UNAVAILABLE; no NVML sample</dd>
+    </dl></div>
+  </section>
+
   <div class="controls">
-    <button id="reverify">Re-verify chain</button>
-    <button id="tamper">Tamper a receipt &rarr; watch it break</button>
-    <button id="reset">Reset sample</button>
+    <button id="reverify" type="button">Re-verify sample</button>
+    <button id="tamper" type="button">Tamper sample &rarr; watch it break</button>
+    <button id="reset" type="button">Reset sample</button>
   </div>
+
+  <section class="paths" aria-label="Investor and evaluator paths">
+    <article class="path"><h2>Investor summary</h2><p>The showcase makes provenance integrity inspectable and demonstrates a visible failure under tampering without presenting the fixture as live telemetry.</p><a href="https://a11oy.net" target="_blank" rel="noopener">Inspect the evidence index →</a></article>
+    <article class="path"><h2>Developer / evaluator path</h2><p>Re-verify the untouched sample, trigger tamper detection, inspect canonical preimages, then reproduce with the pinned kernel source.</p><a href="https://huggingface.co/SZLHOLDINGS/szl-provctl" target="_blank" rel="noopener">Open the canonical kernel →</a></article>
+  </section>
 
   <h2>Provenance DAG</h2>
   <div class="sub" id="dagmeta"></div>
@@ -183,12 +215,12 @@ details summary{cursor:pointer;color:var(--c)}
     var allOk = (matched===total) && edgeOk;
     var v = document.getElementById("verdict");
     if(allOk){
-      v.innerHTML = '<span class="badge ok glow">DAG VERIFIED · '+matched+'/'+total
+      v.innerHTML = '<span class="badge ok glow">SAMPLE VERIFIED · '+matched+'/'+total
         +' SHA3-256 digests re-hashed &amp; matched in your browser · '+edgeCount+'/'+edgeCount+' edges consistent</span>'
         +' <span class="badge">MEASURED-in-your-browser</span>';
     } else {
       var where = anyBreak ? (' at node "'+esc(anyBreak.node)+'"'+(anyBreak.edge?(' (edge from '+esc(anyBreak.edge)+')'):(' receipt #'+anyBreak.at))) : '';
-      v.innerHTML = '<span class="badge bad glow">TAMPER DETECTED — verification FAILED'+where+'</span>'
+      v.innerHTML = '<span class="badge bad glow">SAMPLE TAMPER DETECTED — verification FAILED'+where+'</span>'
         +' <span class="badge">'+matched+'/'+total+' digests matched</span>';
     }
 
