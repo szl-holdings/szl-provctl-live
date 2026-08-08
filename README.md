@@ -1,3 +1,15 @@
+---
+title: szl-provctl-live
+emoji: "🔗"
+colorFrom: green
+colorTo: gray
+sdk: static
+app_file: index.html
+pinned: false
+license: apache-2.0
+short_description: "Provenance-DAG verify, re-hashed in your browser"
+---
+
 # szl-provctl-live
 
 **Provenance-DAG verify hologram.** A static, self-contained page that renders a **real**
