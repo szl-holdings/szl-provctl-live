@@ -252,6 +252,19 @@ class StaticSpaceContractTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ContractError, "JSON request failed closed"):
                 MODULE._request_json("https://api.github.test/repos/example/repo", "token")
 
+    def test_guard_missing_token_fails_closed_before_api(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "",
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with mock.patch.object(MODULE, "_request_json") as request_json:
+                with self.assertRaisesRegex(MODULE.ContractError, "GITHUB_TOKEN is required"):
+                    MODULE.require_governed_main(SOURCE_SHA)
+        request_json.assert_not_called()
+
     def test_dco_validates_every_commit_with_matching_trailer(self) -> None:
         commits = ["1" * 40, "2" * 40]
         messages = {
@@ -316,6 +329,28 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertIn('python-version: "3.12.13"', workflow)
         self.assertNotIn('python-version: "3.12"\n', workflow)
         self.assertIn("needs: [validate, dco]", workflow)
+        self.assertIn(
+            "format('pr-{0}', github.event.pull_request.number) || 'production'",
+            workflow,
+        )
+        self.assertIn(
+            "actions/create-github-app-token@"
+            "bcd2ba49218906704ab6c1aa796996da409d3eb1",
+            workflow,
+        )
+        self.assertIn("permission-administration: read", workflow)
+        self.assertIn("permission-contents: read", workflow)
+        self.assertIn('test -n "$GOVERNANCE_TOKEN"', workflow)
+        token = workflow.index("Mint least-privilege governed ruleset reader")
+        guard = workflow.index("Reauthorize exact governed main without HF credentials")
+        hf_credential = workflow.index("HF_TOKEN: ${{ secrets.HF_TOKEN }}")
+        self.assertLess(token, guard)
+        self.assertLess(guard, hf_credential)
+        self.assertIn(
+            "GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}",
+            workflow,
+        )
+        self.assertNotIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
 
     def test_deploy_uses_parent_lock_and_full_tree_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
