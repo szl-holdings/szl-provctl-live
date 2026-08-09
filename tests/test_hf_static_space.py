@@ -139,7 +139,9 @@ class FakeHfApi:
         self.events = events if events is not None else []
         self.upload_kwargs: dict | None = None
 
-    def space_info(self, target: str, token: str):
+    def space_info(self, target: str, token: str, timeout: float):
+        if timeout <= 0 or timeout > MODULE.HF_REQUEST_TIMEOUT_CAP:
+            raise AssertionError("parent lookup timeout was not strictly capped")
         self.events.append("parent")
         return SimpleNamespace(sha=PARENT_SHA)
 
@@ -176,6 +178,7 @@ def write_deploy_result(bundle: Path, result_path: Path) -> dict:
         "hf_revision": TARGET_SHA,
         "bundle_sha256": manifest["bundle_sha256"],
         "target": MODULE.load_config()["target"],
+        "upload_transport": "RETURNED_AUTHORITATIVE_REVISION",
         "authorization": {"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
     }
     result_path.write_bytes(MODULE.canonical_json(result))
@@ -481,11 +484,31 @@ class StaticSpaceContractTests(unittest.TestCase):
             workflow,
         )
         self.assertNotIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
+        self.assertIn('python -I -m venv "$VALIDATOR_VENV"', workflow)
+        self.assertIn('test ! -e "$VALIDATOR_VENV"', workflow)
         self.assertIn('python -I -m venv "$PUBLISHER_VENV"', workflow)
         self.assertIn('test ! -e "$PUBLISHER_VENV"', workflow)
-        self.assertIn("--require-hashes --only-binary=:all: --ignore-installed", workflow)
+        self.assertGreaterEqual(
+            workflow.count("--require-hashes --only-binary=:all: --ignore-installed"),
+            2,
+        )
+        self.assertNotIn("--dry-run", workflow)
+        self.assertIn(
+            'm.version("huggingface-hub") == "1.19.0" == h.__version__',
+            workflow,
+        )
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("attestations: write", workflow)
+        self.assertIn(
+            "actions/attest-build-provenance@"
+            "a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32",
+            workflow,
+        )
         self.assertIn('"$PUBLISHER_PYTHON" -I scripts/hf_static_space.py deploy', workflow)
         self.assertIn('"$PUBLISHER_PYTHON" -I scripts/hf_static_space.py attest', workflow)
+        self.assertIn("--failure-output", workflow)
+        self.assertIn("workflow-outcome", workflow)
+        self.assertIn("Require terminal governed success", workflow)
         self.assertIn("hf-publication-partial.json", workflow)
 
     def test_deploy_uses_parent_lock_and_full_tree_replacement(self) -> None:
@@ -493,6 +516,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             root = Path(temporary)
             bundle = root / "bundle"
             result_path = root / "result.json"
+            failure_path = root / "failure.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
             events: list[str] = []
             api = FakeHfApi(events=events)
@@ -503,12 +527,25 @@ class StaticSpaceContractTests(unittest.TestCase):
                 events.append("guard")
                 return authorization
 
-            with mock.patch.dict(os.environ, {"HF_TOKEN": "test-token"}, clear=False):
-                with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
-                    with mock.patch.object(
-                        MODULE, "require_governed_main", side_effect=authorize
-                    ):
-                        result = MODULE.deploy_bundle(bundle, SOURCE_SHA, result_path)
+            with mock.patch.dict(
+                os.environ, {"HF_TOKEN": "test-token"}, clear=False
+            ), mock.patch.dict(
+                sys.modules, {"huggingface_hub": fake_hub}
+            ), mock.patch.object(
+                MODULE, "require_governed_main", side_effect=authorize
+            ), mock.patch.object(
+                MODULE, "_require_strict_mutation_timer"
+            ), mock.patch.object(
+                MODULE,
+                "_run_with_wall_clock_deadline",
+                side_effect=lambda action, _deadline, _label: action(),
+            ):
+                result = MODULE.deploy_bundle(
+                    bundle,
+                    SOURCE_SHA,
+                    result_path,
+                    failure_output_path=failure_path,
+                )
             assert api.upload_kwargs is not None
             self.assertEqual(api.upload_kwargs["parent_commit"], PARENT_SHA)
             self.assertEqual(api.upload_kwargs["delete_patterns"], "*")
@@ -516,24 +553,156 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertEqual(result["previous_hf_revision"], PARENT_SHA)
             self.assertEqual(result["hf_revision"], TARGET_SHA)
             self.assertEqual(events, ["parent", "guard", "upload"])
+            self.assertFalse(failure_path.exists())
 
     def test_deploy_stale_parent_fails_without_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             bundle = root / "bundle"
             result_path = root / "result.json"
+            failure_path = root / "failure.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
             api = FakeHfApi(stale=True)
             fake_hub = SimpleNamespace(HfApi=lambda token: api)
-            with mock.patch.dict(os.environ, {"HF_TOKEN": "test-token"}, clear=False):
-                with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
-                    with mock.patch.object(
-                        MODULE,
-                        "require_governed_main",
-                        return_value={"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
-                    ):
-                        with self.assertRaisesRegex(RuntimeError, "parent commit changed"):
-                            MODULE.deploy_bundle(bundle, SOURCE_SHA, result_path)
+            with mock.patch.dict(
+                os.environ, {"HF_TOKEN": "test-token"}, clear=False
+            ), mock.patch.dict(
+                sys.modules, {"huggingface_hub": fake_hub}
+            ), mock.patch.object(
+                MODULE,
+                "require_governed_main",
+                return_value={"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
+            ), mock.patch.object(
+                MODULE, "_require_strict_mutation_timer"
+            ), mock.patch.object(
+                MODULE,
+                "_run_with_wall_clock_deadline",
+                side_effect=lambda action, _deadline, _label: action(),
+            ), mock.patch.object(
+                MODULE,
+                "_recover_authoritative_revision",
+                side_effect=MODULE.ContractError("no authoritative revision"),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.ContractError,
+                    "canonical machine-readable evidence was persisted",
+                ):
+                    MODULE.deploy_bundle(
+                        bundle,
+                        SOURCE_SHA,
+                        result_path,
+                        failure_output_path=failure_path,
+                    )
+            self.assertFalse(result_path.exists())
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            self.assertEqual(failure["status"], "MUTATION_OUTCOME_UNKNOWN")
+            self.assertTrue(failure["upload_call_entered"])
+            self.assertIsNone(failure["hf_revision"])
+            self.assertFalse(failure["receipt_minted"])
+            self.assertFalse(failure["deployment_success"])
+            self.assertEqual(failure_path.read_bytes(), MODULE.canonical_json(failure))
+
+    def test_deploy_requires_evidence_path_at_call_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(TypeError, "failure_output_path"):
+                MODULE.deploy_bundle(root / "bundle", SOURCE_SHA, root / "result.json")
+
+    def test_pre_mutation_failure_writes_canonical_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            failure_path = root / "failure.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(
+                    MODULE.ContractError,
+                    "canonical machine-readable evidence was persisted",
+                ):
+                    MODULE.deploy_bundle(
+                        bundle,
+                        SOURCE_SHA,
+                        result_path,
+                        failure_output_path=failure_path,
+                    )
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            self.assertEqual(failure["status"], "FAILED_BEFORE_MUTATION")
+            self.assertFalse(failure["upload_call_entered"])
+            self.assertIsNone(failure["hf_revision"])
+            self.assertFalse(failure["receipt_minted"])
+            self.assertFalse(failure["deployment_success"])
+            self.assertEqual(failure_path.read_bytes(), MODULE.canonical_json(failure))
+            self.assertFalse(result_path.exists())
+
+    def test_known_revision_failure_writes_partial_after_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result-directory"
+            failure_path = root / "failure.json"
+            result_path.mkdir()
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            api = FakeHfApi()
+            fake_hub = SimpleNamespace(HfApi=lambda token: api)
+            with mock.patch.dict(
+                os.environ, {"HF_TOKEN": "test-token"}, clear=False
+            ), mock.patch.dict(
+                sys.modules, {"huggingface_hub": fake_hub}
+            ), mock.patch.object(
+                MODULE,
+                "require_governed_main",
+                return_value={"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
+            ), mock.patch.object(
+                MODULE, "_require_strict_mutation_timer"
+            ), mock.patch.object(
+                MODULE,
+                "_run_with_wall_clock_deadline",
+                side_effect=lambda action, _deadline, _label: action(),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.ContractError,
+                    "canonical machine-readable evidence was persisted",
+                ):
+                    MODULE.deploy_bundle(
+                        bundle,
+                        SOURCE_SHA,
+                        result_path,
+                        failure_output_path=failure_path,
+                    )
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            self.assertEqual(failure["status"], "PARTIAL_AFTER_MUTATION")
+            self.assertTrue(failure["upload_call_entered"])
+            self.assertEqual(failure["hf_revision"], TARGET_SHA)
+            self.assertFalse(failure["receipt_minted"])
+            self.assertFalse(failure["deployment_success"])
+            self.assertEqual(failure_path.read_bytes(), MODULE.canonical_json(failure))
+
+    def test_evidence_write_failure_is_terminal_and_truthful(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            failure_path = root / "failure.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                MODULE,
+                "_write_mutation_failure",
+                side_effect=OSError("disk full token=raw-secret"),
+            ):
+                with self.assertRaises(MODULE.ContractError) as raised:
+                    MODULE.deploy_bundle(
+                        bundle,
+                        SOURCE_SHA,
+                        result_path,
+                        failure_output_path=failure_path,
+                    )
+            message = str(raised.exception)
+            self.assertIn("mandatory machine-readable evidence could not be persisted", message)
+            self.assertNotIn("was persisted", message)
+            self.assertNotIn("raw-secret", message)
+            self.assertIn("<redacted>", message)
+            self.assertFalse(failure_path.exists())
             self.assertFalse(result_path.exists())
 
     def test_live_tree_requires_exact_replacement(self) -> None:
@@ -564,9 +733,18 @@ class StaticSpaceContractTests(unittest.TestCase):
             (302, b"", f"/index.html?{query}"),
             (200, expected, None),
         ]
-        with mock.patch.object(MODULE, "_public_response", side_effect=responses):
-            actual = MODULE._fetch_public_index(origin, SOURCE_SHA)
+        deadlines: list[float] = []
+
+        def public_response(_url, deadline):
+            deadlines.append(deadline)
+            return responses.pop(0)
+
+        with mock.patch.object(
+            MODULE, "_public_response", side_effect=public_response
+        ):
+            actual = MODULE._fetch_public_index(origin, SOURCE_SHA, 1234.5)
         self.assertEqual(actual, expected)
+        self.assertEqual(deadlines, [1234.5, 1234.5])
         self.assertEqual(
             MODULE.require_exact_public_index(actual, expected), MODULE.sha256_bytes(expected)
         )
@@ -580,12 +758,12 @@ class StaticSpaceContractTests(unittest.TestCase):
             return_value=(302, b"", f"https://evil.example/index.html?{query}"),
         ):
             with self.assertRaisesRegex(MODULE.ContractError, "unsafe redirect"):
-                MODULE._fetch_public_index(origin, SOURCE_SHA)
+                MODULE._fetch_public_index(origin, SOURCE_SHA, float("inf"))
         with mock.patch.object(
             MODULE, "_public_response", return_value=(200, b"unexpected", None)
         ):
             with self.assertRaisesRegex(MODULE.ContractError, "expected one 302"):
-                MODULE._fetch_public_index(origin, SOURCE_SHA)
+                MODULE._fetch_public_index(origin, SOURCE_SHA, float("inf"))
 
     def test_public_index_rejects_wrong_bytes(self) -> None:
         with self.assertRaisesRegex(MODULE.ContractError, "public index bytes differ"):
@@ -609,6 +787,17 @@ class StaticSpaceContractTests(unittest.TestCase):
         )
         self.assertNotIn("raw-secret", diagnostic)
         self.assertIn("<redacted>", diagnostic)
+
+    def test_request_timeout_is_capped_by_remaining_deadline(self) -> None:
+        with mock.patch.object(MODULE.time, "monotonic", return_value=100.0):
+            self.assertEqual(
+                MODULE._remaining_timeout(105.0, 30.0, "request"), 5.0
+            )
+            self.assertEqual(
+                MODULE._remaining_timeout(200.0, 30.0, "request"), 30.0
+            )
+            with self.assertRaisesRegex(MODULE.ContractError, "deadline expired"):
+                MODULE._remaining_timeout(100.0, 30.0, "request")
 
     def test_terminal_public_bytes_fail_without_retry(self) -> None:
         with mock.patch.object(
@@ -637,18 +826,23 @@ class StaticSpaceContractTests(unittest.TestCase):
             write_deploy_result(bundle, result_path)
             events: list[str] = []
 
-            def hf_json(url: str):
+            deadlines: list[float] = []
+
+            def hf_json(url: str, deadline: float):
+                deadlines.append(deadline)
                 if "/tree/" in url:
                     events.append("tree")
                     return live_tree(bundle)
                 events.append("runtime")
                 return {"sha": TARGET_SHA, "runtime": {"stage": "RUNNING"}}
 
-            def public_index(*_args):
+            def public_index(_origin, _source_sha, deadline):
+                deadlines.append(deadline)
                 events.append("index")
                 return (bundle / "index.html").read_bytes()
 
-            def provenance(*_args):
+            def provenance(_url, deadline):
+                deadlines.append(deadline)
                 events.append("provenance")
                 return 200, (bundle / "SPACE_PROVENANCE.json").read_bytes(), None
 
@@ -677,6 +871,8 @@ class StaticSpaceContractTests(unittest.TestCase):
                             )
             self.assertEqual(attestation["status"], "MEASURED")
             self.assertEqual(events, ["runtime", "tree", "index", "provenance", "guard"])
+            self.assertEqual(len(deadlines), 4)
+            self.assertEqual(len(set(deadlines)), 1)
             self.assertTrue(output_path.is_file())
             self.assertFalse(partial_path.exists())
 
@@ -690,7 +886,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             MODULE.build_bundle(bundle, SOURCE_SHA)
             write_deploy_result(bundle, result_path)
 
-            def hf_json(url: str):
+            def hf_json(url: str, _deadline: float):
                 if "/tree/" in url:
                     return live_tree(bundle)
                 return {"sha": TARGET_SHA, "runtime": {"stage": "RUNNING"}}
@@ -728,7 +924,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                                     partial_path,
                                 )
             partial = json.loads(partial_path.read_text(encoding="utf-8"))
-            self.assertEqual(partial["status"], "PARTIAL")
+            self.assertEqual(partial["status"], "PARTIAL_AFTER_MUTATION")
             self.assertFalse(partial["measured"])
             self.assertFalse(partial["live_success"])
             self.assertEqual(partial["hf_revision"], TARGET_SHA)
@@ -766,6 +962,113 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertEqual(partial["failure_stage"], "runtime_readback")
             self.assertNotIn("raw-secret", partial["diagnostic"])
             self.assertFalse(output_path.exists())
+
+    def test_workflow_stage_failures_preserve_exact_revision_without_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            measurement_path = root / "measurement.json"
+            mutation_failure_path = root / "mutation-failure.json"
+            partial_path = root / "partial.json"
+            receipt_path = root / "receipt.json"
+            workflow_failure_path = root / "workflow-failure.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            write_deploy_result(bundle, result_path)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            measurement = {
+                "schema": "szl.hf-live-attestation/v2",
+                "status": "MEASURED",
+                "source_revision": SOURCE_SHA,
+                "hf_revision": TARGET_SHA,
+                "target": result["target"],
+                "receipt_minted": False,
+                "deployment_success": False,
+            }
+            measurement_path.write_bytes(MODULE.canonical_json(measurement))
+            cases = (
+                ("failure", "skipped", "", "success_evidence_upload"),
+                ("success", "failure", "", "oidc_attestation"),
+                ("success", "success", "terminal_evidence_upload", "terminal_evidence_upload"),
+            )
+            for success_evidence, oidc, forced, expected_stage in cases:
+                with self.subTest(stage=expected_stage):
+                    failure = MODULE.synthesize_workflow_outcome(
+                        SOURCE_SHA,
+                        result_path,
+                        measurement_path,
+                        mutation_failure_path,
+                        partial_path,
+                        receipt_path,
+                        workflow_failure_path,
+                        "success",
+                        "success",
+                        success_evidence,
+                        oidc,
+                        "attestation-id" if oidc == "success" else "",
+                        "https://github.example/attestation" if oidc == "success" else "",
+                        forced,
+                    )
+                    self.assertEqual(failure["status"], "WORKFLOW_STAGE_FAILURE")
+                    self.assertEqual(failure["failure_stage"], expected_stage)
+                    self.assertEqual(failure["hf_revision"], TARGET_SHA)
+                    self.assertFalse(failure["receipt_minted"])
+                    self.assertFalse(failure["deployment_success"])
+                    self.assertFalse(receipt_path.exists())
+                    self.assertEqual(
+                        workflow_failure_path.read_bytes(),
+                        MODULE.canonical_json(failure),
+                    )
+
+    def test_successful_oidc_outcome_mints_exact_measurement_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            measurement_path = root / "measurement.json"
+            mutation_failure_path = root / "mutation-failure.json"
+            partial_path = root / "partial.json"
+            receipt_path = root / "receipt.json"
+            workflow_failure_path = root / "workflow-failure.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            write_deploy_result(bundle, result_path)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            measurement = {
+                "schema": "szl.hf-live-attestation/v2",
+                "status": "MEASURED",
+                "source_revision": SOURCE_SHA,
+                "hf_revision": TARGET_SHA,
+                "target": result["target"],
+                "receipt_minted": False,
+                "deployment_success": False,
+            }
+            measurement_path.write_bytes(MODULE.canonical_json(measurement))
+            receipt = MODULE.synthesize_workflow_outcome(
+                SOURCE_SHA,
+                result_path,
+                measurement_path,
+                mutation_failure_path,
+                partial_path,
+                receipt_path,
+                workflow_failure_path,
+                "success",
+                "success",
+                "success",
+                "success",
+                "attestation-id",
+                "https://github.example/attestation",
+            )
+            self.assertEqual(receipt["status"], "OIDC_ATTESTED_DEPLOYMENT")
+            self.assertEqual(receipt["source_revision"], SOURCE_SHA)
+            self.assertEqual(receipt["hf_revision"], TARGET_SHA)
+            self.assertEqual(
+                receipt["measurement"]["sha256"],
+                MODULE.sha256_bytes(measurement_path.read_bytes()),
+            )
+            self.assertTrue(receipt["receipt_minted"])
+            self.assertTrue(receipt["deployment_success"])
+            self.assertEqual(receipt_path.read_bytes(), MODULE.canonical_json(receipt))
+            self.assertFalse(workflow_failure_path.exists())
 
 
 if __name__ == "__main__":

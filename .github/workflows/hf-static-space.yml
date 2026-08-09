@@ -35,17 +35,25 @@ jobs:
       - name: Verify exact checkout and release contracts
         env:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          VALIDATOR_VENV: ${{ runner.temp }}/hf-validator-venv
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          python -m pip install --disable-pip-version-check --dry-run --ignore-installed \
-            --only-binary=:all: --require-hashes \
+          test "$(python -I -c 'import platform; print(platform.python_version())')" = "3.12.13"
+          test ! -e "$VALIDATOR_VENV"
+          python -I -m venv "$VALIDATOR_VENV"
+          VALIDATOR_PYTHON="$VALIDATOR_VENV/bin/python"
+          test "$($VALIDATOR_PYTHON -I -c 'import platform; print(platform.python_version())')" = "3.12.13"
+          "$VALIDATOR_PYTHON" -I -m pip install --disable-pip-version-check \
+            --require-hashes --only-binary=:all: --ignore-installed \
             -r requirements/hf-publisher.lock
-          python -m unittest discover -s tests -v
-          python scripts/hf_static_space.py build \
+          "$VALIDATOR_PYTHON" -I -c \
+            'import importlib.metadata as m, huggingface_hub as h; assert m.version("huggingface-hub") == "1.19.0" == h.__version__'
+          "$VALIDATOR_PYTHON" -I -m unittest discover -s tests -v
+          "$VALIDATOR_PYTHON" -I scripts/hf_static_space.py build \
             --source-sha "$SOURCE_SHA" \
             --output "$RUNNER_TEMP/hf-static-space"
-          python scripts/hf_static_space.py validate \
+          "$VALIDATOR_PYTHON" -I scripts/hf_static_space.py validate \
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/hf-static-space"
 
@@ -83,6 +91,10 @@ jobs:
     name: publish-exact-protected-main
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [validate, dco]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -145,8 +157,12 @@ jobs:
           "$PUBLISHER_PYTHON" -I -m pip install --disable-pip-version-check \
             --require-hashes --only-binary=:all: --ignore-installed \
             -r requirements/hf-publisher.lock
+          "$PUBLISHER_PYTHON" -I -c \
+            'import importlib.metadata as m, huggingface_hub as h; assert m.version("huggingface-hub") == "1.19.0" == h.__version__'
           echo "PUBLISHER_PYTHON=$PUBLISHER_PYTHON" >> "$GITHUB_ENV"
       - name: Publish exact bundle with optimistic target lock
+        id: publish
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -156,8 +172,12 @@ jobs:
           "$PUBLISHER_PYTHON" -I scripts/hf_static_space.py deploy \
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/hf-static-space" \
-            --result "$RUNNER_TEMP/hf-deploy-result.json"
+            --result "$RUNNER_TEMP/hf-deploy-result.json" \
+            --failure-output "$RUNNER_TEMP/hf-publication-failure.json"
       - name: Attest exact running revision, bytes, and public source identity
+        id: measurement
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -170,16 +190,103 @@ jobs:
             --result "$RUNNER_TEMP/hf-deploy-result.json" \
             --output "$RUNNER_TEMP/hf-live-attestation.json" \
             --failure-output "$RUNNER_TEMP/hf-publication-partial.json"
-      - name: Upload deployment evidence
-        if: always()
+      - name: Upload exact local measurement before OIDC
+        id: success-evidence
+        if: steps.measurement.outcome == 'success'
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hf-static-space-evidence
+          name: hf-static-space-local-measurement
           path: |
             ${{ runner.temp }}/hf-static-space/hf-deploy-manifest.json
             ${{ runner.temp }}/hf-static-space/SPACE_PROVENANCE.json
             ${{ runner.temp }}/hf-deploy-result.json
             ${{ runner.temp }}/hf-live-attestation.json
-            ${{ runner.temp }}/hf-publication-partial.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
+      - name: Attest canonical exact-revision measurement with GitHub OIDC
+        id: oidc
+        if: steps.measurement.outcome == 'success' && steps.success-evidence.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: ${{ runner.temp }}/hf-live-attestation.json
+      - name: Synthesize final receipt or workflow-stage failure
+        if: always()
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          ATTESTATION_ID: ${{ steps.oidc.outputs.attestation-id }}
+          ATTESTATION_URL: ${{ steps.oidc.outputs.attestation-url }}
+        run: |
+          set -euo pipefail
+          "$PUBLISHER_PYTHON" -I scripts/hf_static_space.py workflow-outcome \
+            --source-sha "$SOURCE_SHA" \
+            --result "$RUNNER_TEMP/hf-deploy-result.json" \
+            --measurement "$RUNNER_TEMP/hf-live-attestation.json" \
+            --mutation-failure "$RUNNER_TEMP/hf-publication-failure.json" \
+            --partial "$RUNNER_TEMP/hf-publication-partial.json" \
+            --receipt "$RUNNER_TEMP/hf-oidc-receipt.json" \
+            --workflow-failure "$RUNNER_TEMP/hf-workflow-stage-failure.json" \
+            --publish-outcome "${{ steps.publish.outcome }}" \
+            --measurement-outcome "${{ steps.measurement.outcome }}" \
+            --success-evidence-outcome "${{ steps.success-evidence.outcome }}" \
+            --oidc-outcome "${{ steps.oidc.outcome }}" \
+            --attestation-id "$ATTESTATION_ID" \
+            --attestation-url "$ATTESTATION_URL"
+      - name: Upload terminal governed evidence
+        id: terminal-evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-static-space-terminal-evidence
+          path: |
+            ${{ runner.temp }}/hf-static-space/hf-deploy-manifest.json
+            ${{ runner.temp }}/hf-static-space/SPACE_PROVENANCE.json
+            ${{ runner.temp }}/hf-deploy-result.json
+            ${{ runner.temp }}/hf-live-attestation.json
+            ${{ runner.temp }}/hf-publication-failure.json
+            ${{ runner.temp }}/hf-publication-partial.json
+            ${{ runner.temp }}/hf-oidc-receipt.json
+            ${{ runner.temp }}/hf-workflow-stage-failure.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Synthesize terminal artifact-upload failure
+        if: always() && steps.terminal-evidence.outcome != 'success'
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          "$PUBLISHER_PYTHON" -I scripts/hf_static_space.py workflow-outcome \
+            --source-sha "$SOURCE_SHA" \
+            --result "$RUNNER_TEMP/hf-deploy-result.json" \
+            --measurement "$RUNNER_TEMP/hf-live-attestation.json" \
+            --mutation-failure "$RUNNER_TEMP/hf-publication-failure.json" \
+            --partial "$RUNNER_TEMP/hf-publication-partial.json" \
+            --receipt "$RUNNER_TEMP/hf-oidc-receipt.json" \
+            --workflow-failure "$RUNNER_TEMP/hf-workflow-stage-failure.json" \
+            --publish-outcome "${{ steps.publish.outcome }}" \
+            --measurement-outcome "${{ steps.measurement.outcome }}" \
+            --success-evidence-outcome "${{ steps.success-evidence.outcome }}" \
+            --oidc-outcome "${{ steps.oidc.outcome }}" \
+            --force-failure-stage terminal_evidence_upload
+      - name: Upload terminal failure evidence
+        if: always() && steps.terminal-evidence.outcome != 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hf-static-space-terminal-upload-failure
+          path: ${{ runner.temp }}/hf-workflow-stage-failure.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Require terminal governed success
+        if: always()
+        run: |
+          set -euo pipefail
+          test "${{ steps.publish.outcome }}" = "success"
+          test "${{ steps.measurement.outcome }}" = "success"
+          test "${{ steps.success-evidence.outcome }}" = "success"
+          test "${{ steps.oidc.outcome }}" = "success"
+          test "${{ steps.terminal-evidence.outcome }}" = "success"
+          test -f "$RUNNER_TEMP/hf-oidc-receipt.json"
+          test ! -f "$RUNNER_TEMP/hf-workflow-stage-failure.json"
