@@ -122,7 +122,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             detail,
         ]
         environment = {
-            "GITHUB_REPOSITORY": "szl-holdings/receipt-chain-live",
+            "GITHUB_REPOSITORY": "szl-holdings/szl-provctl-live",
             "GITHUB_REF": "refs/heads/main",
             "GITHUB_TOKEN": "app-token",
         }
