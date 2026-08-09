@@ -133,10 +133,19 @@ jobs:
           GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}
           SOURCE_SHA: ${{ github.sha }}
         run: python scripts/hf_static_space.py guard --source-sha "$SOURCE_SHA"
-      - name: Install pinned Hugging Face client without credentials
+      - name: Install pinned Hugging Face client in a clean exact-Python venv
+        env:
+          PUBLISHER_VENV: ${{ runner.temp }}/hf-publisher-venv
         run: |
-          python -m pip install --disable-pip-version-check --only-binary=:all: \
-            --require-hashes -r requirements/hf-publisher.lock
+          set -euo pipefail
+          test "$(python -I -c 'import platform; print(platform.python_version())')" = "3.12.13"
+          test ! -e "$PUBLISHER_VENV"
+          python -I -m venv "$PUBLISHER_VENV"
+          PUBLISHER_PYTHON="$PUBLISHER_VENV/bin/python"
+          "$PUBLISHER_PYTHON" -I -m pip install --disable-pip-version-check \
+            --require-hashes --only-binary=:all: --ignore-installed \
+            -r requirements/hf-publisher.lock
+          echo "PUBLISHER_PYTHON=$PUBLISHER_PYTHON" >> "$GITHUB_ENV"
       - name: Publish exact bundle with optimistic target lock
         env:
           GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}
@@ -144,21 +153,23 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          python scripts/hf_static_space.py deploy \
+          "$PUBLISHER_PYTHON" -I scripts/hf_static_space.py deploy \
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/hf-static-space" \
             --result "$RUNNER_TEMP/hf-deploy-result.json"
       - name: Attest exact running revision, bytes, and public source identity
         env:
+          GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          python scripts/hf_static_space.py attest \
+          "$PUBLISHER_PYTHON" -I scripts/hf_static_space.py attest \
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/hf-static-space" \
             --result "$RUNNER_TEMP/hf-deploy-result.json" \
-            --output "$RUNNER_TEMP/hf-live-attestation.json"
+            --output "$RUNNER_TEMP/hf-live-attestation.json" \
+            --failure-output "$RUNNER_TEMP/hf-publication-partial.json"
       - name: Upload deployment evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -169,5 +180,6 @@ jobs:
             ${{ runner.temp }}/hf-static-space/SPACE_PROVENANCE.json
             ${{ runner.temp }}/hf-deploy-result.json
             ${{ runner.temp }}/hf-live-attestation.json
+            ${{ runner.temp }}/hf-publication-partial.json
           if-no-files-found: warn
           retention-days: 90

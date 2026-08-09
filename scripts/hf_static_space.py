@@ -28,17 +28,32 @@ REQUIRED_RULE_TYPES = {
     "required_status_checks",
 }
 GITHUB_ACTIONS_INTEGRATION_ID = 15368
+GOVERNED_RULESET_ID = 20597034
+GOVERNED_RULESET_NAME = "static-spaces-governed-default-branches"
+GOVERNED_RULESET_SOURCE = "szl-holdings"
+TARGET_REPOSITORY_IDS = {
+    "szl-holdings/lambda-gate-holo": 1295931629,
+    "szl-holdings/governed-norm-holo": 1295931607,
+    "szl-holdings/energy-attest-holo": 1295929955,
+    "szl-holdings/receipt-chain-live": 1295940016,
+    "szl-holdings/szl-provctl-live": 1295941247,
+}
 REQUIRED_STATUS_CONTEXTS = {
     "DCO": GITHUB_ACTIONS_INTEGRATION_ID,
     "validate-static-space": GITHUB_ACTIONS_INTEGRATION_ID,
 }
 TERMINAL_STAGES = {"BUILD_ERROR", "CONFIG_ERROR", "RUNTIME_ERROR"}
+TRANSIENT_HTTP_STATUSES = frozenset({429} | set(range(500, 600)))
 UA = "szl-hf-static-space/1.0"
 DCO_TRAILER = re.compile(r"^Signed-off-by:\s*(.+?)\s*<([^<>\s]+)>$", re.IGNORECASE)
 
 
 class ContractError(RuntimeError):
     """The release request does not satisfy the governed publication contract."""
+
+
+class TransientReadbackError(RuntimeError):
+    """A retryable public or Hugging Face readback transport failure."""
 
 
 def canonical_json(value: object) -> bytes:
@@ -350,51 +365,127 @@ def _request_json(url: str, token: str = "") -> object:
         ) from error
 
 
-def _ruleset_authorizes_exact_default_branch(detail: object) -> bool:
-    if not isinstance(detail, dict):
+def _pull_request_parameters_are_exact(parameters: object) -> bool:
+    if not isinstance(parameters, dict):
         return False
-    if detail.get("target") != "branch" or detail.get("enforcement") != "active":
+    approvals = parameters.get("required_approving_review_count")
+    return (
+        type(approvals) is int
+        and approvals == 0
+        and parameters.get("dismiss_stale_reviews_on_push") is True
+        and parameters.get("require_code_owner_review") is False
+        and parameters.get("require_last_push_approval") is False
+        and parameters.get("required_review_thread_resolution") is True
+        and parameters.get("required_reviewers") == []
+        and parameters.get("allowed_merge_methods") == ["squash", "rebase"]
+    )
+
+
+def _status_check_parameters_are_exact(parameters: object) -> bool:
+    if not isinstance(parameters, dict):
         return False
-    if detail.get("bypass_actors") != []:
+    if parameters.get("strict_required_status_checks_policy") is not True:
         return False
-    ref_name = ((detail.get("conditions") or {}).get("ref_name") or {})
-    include = ref_name.get("include")
-    exclude = ref_name.get("exclude")
-    if include not in (["~DEFAULT_BRANCH"], ["refs/heads/main"]) or exclude != []:
+    if parameters.get("do_not_enforce_on_create") is not False:
         return False
-    rows = detail.get("rules")
-    if not isinstance(rows, list):
-        return False
-    rules = {
-        row.get("type"): row
-        for row in rows
-        if isinstance(row, dict) and isinstance(row.get("type"), str)
-    }
-    if not REQUIRED_RULE_TYPES <= set(rules):
-        return False
-    pull_parameters = rules["pull_request"].get("parameters") or {}
-    approvals = pull_parameters.get("required_approving_review_count")
-    if type(approvals) is not int or approvals < 0:
-        return False
-    if pull_parameters.get("required_review_thread_resolution") is not True:
-        return False
-    status_parameters = rules["required_status_checks"].get("parameters") or {}
-    if status_parameters.get("strict_required_status_checks_policy") is not True:
-        return False
-    required_checks = status_parameters.get("required_status_checks")
-    if not isinstance(required_checks, list):
+    required_checks = parameters.get("required_status_checks")
+    if not isinstance(required_checks, list) or len(required_checks) != len(
+        REQUIRED_STATUS_CONTEXTS
+    ):
         return False
     bound_contexts = {
         row.get("context"): row.get("integration_id")
         for row in required_checks
         if isinstance(row, dict)
+        and set(row) == {"context", "integration_id"}
         and isinstance(row.get("context"), str)
         and type(row.get("integration_id")) is int
-        and row["integration_id"] > 0
     }
-    return all(
-        bound_contexts.get(context) == integration_id
-        for context, integration_id in REQUIRED_STATUS_CONTEXTS.items()
+    return bound_contexts == REQUIRED_STATUS_CONTEXTS
+
+
+def _ruleset_authorizes_exact_default_branch(
+    detail: object, repository_id: int
+) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    if (
+        detail.get("id") != GOVERNED_RULESET_ID
+        or detail.get("name") != GOVERNED_RULESET_NAME
+        or detail.get("source") != GOVERNED_RULESET_SOURCE
+        or detail.get("source_type") != "Organization"
+        or detail.get("target") != "branch"
+        or detail.get("enforcement") != "active"
+    ):
+        return False
+    if detail.get("bypass_actors") != []:
+        return False
+    conditions = detail.get("conditions")
+    if not isinstance(conditions, dict) or set(conditions) != {
+        "repository_id",
+        "ref_name",
+    }:
+        return False
+    ref_name = conditions.get("ref_name")
+    repository_condition = conditions.get("repository_id")
+    if not isinstance(ref_name, dict) or set(ref_name) != {"include", "exclude"}:
+        return False
+    if ref_name.get("include") != ["~DEFAULT_BRANCH"] or ref_name.get("exclude") != []:
+        return False
+    if not isinstance(repository_condition, dict) or set(repository_condition) != {
+        "repository_ids"
+    }:
+        return False
+    repository_ids = repository_condition.get("repository_ids")
+    if (
+        not isinstance(repository_ids, list)
+        or len(repository_ids) != len(TARGET_REPOSITORY_IDS)
+        or any(type(value) is not int for value in repository_ids)
+        or set(repository_ids) != set(TARGET_REPOSITORY_IDS.values())
+        or repository_id not in repository_ids
+    ):
+        return False
+    rows = detail.get("rules")
+    if not isinstance(rows, list):
+        return False
+    typed_rows = [
+        row for row in rows if isinstance(row, dict) and isinstance(row.get("type"), str)
+    ]
+    rules = {row["type"]: row for row in typed_rows}
+    if len(typed_rows) != len(rules) or set(rules) != REQUIRED_RULE_TYPES:
+        return False
+    return _pull_request_parameters_are_exact(
+        rules["pull_request"].get("parameters")
+    ) and _status_check_parameters_are_exact(
+        rules["required_status_checks"].get("parameters")
+    )
+
+
+def _effective_rules_prove_inherited_governance(rows: object) -> bool:
+    if not isinstance(rows, list):
+        return False
+    inherited: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("ruleset_id") != GOVERNED_RULESET_ID:
+            continue
+        if (
+            row.get("ruleset_source") != GOVERNED_RULESET_SOURCE
+            or row.get("ruleset_source_type") != "Organization"
+        ):
+            return False
+        inherited.append(row)
+    typed_rows = [
+        row
+        for row in inherited
+        if isinstance(row.get("type"), str) and row.get("type") in REQUIRED_RULE_TYPES
+    ]
+    rules = {row["type"]: row for row in typed_rows}
+    if len(typed_rows) != len(rules) or set(rules) != REQUIRED_RULE_TYPES:
+        return False
+    return _pull_request_parameters_are_exact(
+        rules["pull_request"].get("parameters")
+    ) and _status_check_parameters_are_exact(
+        rules["required_status_checks"].get("parameters")
     )
 
 
@@ -411,10 +502,22 @@ def require_governed_main(source_sha: str, config_path: Path = DEFAULT_CONFIG) -
         raise ContractError(f"refusing production release from {source_ref!r}")
     if not token:
         raise ContractError("GITHUB_TOKEN is required for protected-main reauthorization")
+    expected_repository_id = TARGET_REPOSITORY_IDS.get(repository)
+    if expected_repository_id is None:
+        raise ContractError("repository is not one of the governed static Space targets")
     metadata = _request_json(f"{api_root}/repos/{repository}", token)
-    if not isinstance(metadata, dict) or metadata.get("default_branch") != "main":
-        raise ContractError("repository default branch is not main")
-    branch = _request_json(f"{api_root}/repos/{repository}/branches/main", token)
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("id") != expected_repository_id
+        or metadata.get("full_name") != repository
+        or metadata.get("default_branch") != "main"
+    ):
+        raise ContractError("repository identity or default branch is not exact")
+    default_branch = metadata["default_branch"]
+    encoded_branch = urllib.parse.quote(default_branch, safe="")
+    branch = _request_json(
+        f"{api_root}/repos/{repository}/branches/{encoded_branch}", token
+    )
     live_sha = str(((branch or {}).get("commit") or {}).get("sha") or "").lower()
     if live_sha != source_sha:
         raise ContractError(
@@ -425,30 +528,45 @@ def require_governed_main(source_sha: str, config_path: Path = DEFAULT_CONFIG) -
     )
     if not isinstance(summaries, list):
         raise ContractError("repository ruleset inventory is unavailable")
-    accepted: list[int] = []
-    for summary in summaries:
-        if (
-            not isinstance(summary, dict)
-            or summary.get("enforcement") != "active"
-            or summary.get("target") != "branch"
-        ):
-            continue
-        ruleset_id = summary.get("id")
-        if not isinstance(ruleset_id, int):
-            continue
-        detail = _request_json(f"{api_root}/repos/{repository}/rulesets/{ruleset_id}", token)
-        if _ruleset_authorizes_exact_default_branch(detail):
-            accepted.append(ruleset_id)
-    if not accepted:
+    summary = next(
+        (
+            row
+            for row in summaries
+            if isinstance(row, dict) and row.get("id") == GOVERNED_RULESET_ID
+        ),
+        None,
+    )
+    if (
+        not isinstance(summary, dict)
+        or summary.get("name") != GOVERNED_RULESET_NAME
+        or summary.get("source") != GOVERNED_RULESET_SOURCE
+        or summary.get("source_type") != "Organization"
+        or summary.get("enforcement") != "active"
+        or summary.get("target") != "branch"
+    ):
+        raise ContractError("governed organization ruleset is not actively inherited")
+    detail = _request_json(
+        f"{api_root}/repos/{repository}/rulesets/{GOVERNED_RULESET_ID}", token
+    )
+    if not _ruleset_authorizes_exact_default_branch(detail, expected_repository_id):
         raise ContractError(
-            "default branch lacks one exact no-bypass ruleset requiring signatures, "
-            "strict integration-bound validator/DCO checks, thread resolution, "
-            "non-fast-forward protection, and linear history"
+            f"organization ruleset {GOVERNED_RULESET_ID} does not match the exact "
+            "five-repository no-bypass static Space policy"
+        )
+    effective = _request_json(
+        f"{api_root}/repos/{repository}/rules/branches/{encoded_branch}", token
+    )
+    if not _effective_rules_prove_inherited_governance(effective):
+        raise ContractError(
+            f"organization ruleset {GOVERNED_RULESET_ID} is not fully effective on "
+            f"{repository}@{default_branch}"
         )
     return {
         "status": "AUTHORIZED_EXACT_PROTECTED_MAIN",
         "source_revision": source_sha,
-        "ruleset_ids": accepted,
+        "repository_id": expected_repository_id,
+        "default_branch": default_branch,
+        "ruleset_ids": [GOVERNED_RULESET_ID],
         "required_status_contexts": sorted(REQUIRED_STATUS_CONTEXTS),
     }
 
@@ -462,7 +580,6 @@ def deploy_bundle(
     source_sha = exact_sha(source_sha)
     config = load_config(config_path)
     manifest = validate_bundle(bundle, source_sha, config_path)
-    authorization = require_governed_main(source_sha, config_path)
     token = os.environ.get("HF_TOKEN", "")
     if not token:
         raise ContractError("HF_TOKEN is unavailable in the approved repository secret store")
@@ -471,6 +588,7 @@ def deploy_bundle(
     api = HfApi(token=token)
     before = api.space_info(config["target"], token=token)
     before_sha = exact_sha(before.sha, "observed Hugging Face parent revision")
+    authorization = require_governed_main(source_sha, config_path)
     commit = api.upload_folder(
         repo_id=config["target"],
         repo_type="space",
@@ -499,14 +617,38 @@ def deploy_bundle(
     return result
 
 
+def _sanitized_diagnostic(error: BaseException) -> str:
+    message = f"{type(error).__name__}: {error}"
+    message = " ".join(message.replace("\x00", " ").split())
+    message = re.sub(
+        r"(?i)(authorization|token|secret|private[-_ ]?key)(\s*[:=]\s*)\S+",
+        r"\1\2<redacted>",
+        message,
+    )
+    return message[:500]
+
+
 def _hf_json(url: str) -> object:
     token = os.environ.get("HF_TOKEN", "")
     headers = {"Accept": "application/json", "User-Agent": UA}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=45) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code in TRANSIENT_HTTP_STATUSES:
+            raise TransientReadbackError(
+                f"Hugging Face API transient HTTP {error.code}"
+            ) from error
+        raise ContractError(f"Hugging Face API terminal HTTP {error.code}") from error
+    except (TimeoutError, ConnectionResetError, urllib.error.URLError, OSError) as error:
+        raise TransientReadbackError(
+            f"Hugging Face API transient transport {type(error).__name__}"
+        ) from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError("Hugging Face API returned malformed JSON") from error
 
 
 def _static_origin(target: str) -> str:
@@ -528,8 +670,16 @@ def _public_response(url: str) -> tuple[int, bytes, str | None]:
         with opener.open(request, timeout=30) as response:
             return response.status, response.read(), response.headers.get("Location")
     except urllib.error.HTTPError as error:
+        if error.code in TRANSIENT_HTTP_STATUSES:
+            raise TransientReadbackError(
+                f"public readback transient HTTP {error.code}"
+            ) from error
         location = error.headers.get("Location") if error.headers is not None else None
         return error.code, error.read(), location
+    except (TimeoutError, ConnectionResetError, urllib.error.URLError, OSError) as error:
+        raise TransientReadbackError(
+            f"public readback transient transport {type(error).__name__}"
+        ) from error
 
 
 def _fetch_public_index(origin: str, source_sha: str) -> bytes:
@@ -595,6 +745,109 @@ def verify_live_tree(bundle: Path, tree: object, allowed_extras: list[str]) -> i
     return len(expected_paths)
 
 
+def _retry_transient(action, deadline: float, label: str):
+    last_diagnostic = "no response"
+    while time.monotonic() < deadline:
+        try:
+            return action()
+        except TransientReadbackError as error:
+            last_diagnostic = _sanitized_diagnostic(error)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(5.0, remaining))
+    raise ContractError(
+        f"{label} exhausted the bounded readback deadline; last={last_diagnostic}"
+    )
+
+
+def _wait_for_exact_running(target: str, target_sha: str, deadline: float) -> tuple[str, str]:
+    last_stage = last_sha = None
+    url = f"https://huggingface.co/api/spaces/{target}"
+    while time.monotonic() < deadline:
+        info = _retry_transient(lambda: _hf_json(url), deadline, "Space runtime readback")
+        if not isinstance(info, dict) or not isinstance(info.get("runtime"), dict):
+            raise ContractError("Space runtime readback schema is malformed")
+        last_sha = info.get("sha")
+        last_stage = info["runtime"].get("stage")
+        if not isinstance(last_sha, str) or not HEX40.fullmatch(last_sha.lower()):
+            raise ContractError("Space runtime revision schema is malformed")
+        last_sha = last_sha.lower()
+        if not isinstance(last_stage, str) or not last_stage:
+            raise ContractError("Space runtime stage schema is malformed")
+        if last_sha == target_sha and last_stage == "RUNNING":
+            return last_stage, last_sha
+        if last_sha == target_sha and last_stage in TERMINAL_STAGES:
+            raise ContractError(f"Space reached {last_stage} at {target_sha}")
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(10.0, remaining))
+    raise ContractError(
+        f"Space did not reach exact RUNNING revision {target_sha}; "
+        f"last stage={last_stage!r} sha={last_sha!r}"
+    )
+
+
+def _read_exact_public_identity(
+    origin: str,
+    source_sha: str,
+    expected_index: bytes,
+    expected_provenance: bytes,
+    deadline: float,
+) -> str:
+    query = urllib.parse.urlencode({"source": source_sha})
+
+    def read_once() -> str:
+        public_index = _fetch_public_index(origin, source_sha)
+        public_index_sha256 = require_exact_public_index(public_index, expected_index)
+        provenance_status, provenance_body, provenance_location = _public_response(
+            origin + "/SPACE_PROVENANCE.json?" + query
+        )
+        if provenance_location is not None:
+            raise ContractError("public provenance route unexpectedly redirected")
+        if provenance_status != 200:
+            raise ContractError(
+                f"public provenance expected terminal 200, observed {provenance_status}"
+            )
+        if provenance_body != expected_provenance:
+            raise ContractError(
+                "public provenance bytes differ: "
+                f"expected sha256={sha256_bytes(expected_provenance)} "
+                f"observed sha256={sha256_bytes(provenance_body)}"
+            )
+        return public_index_sha256
+
+    return _retry_transient(read_once, deadline, "public static source identity")
+
+
+def _write_partial_evidence(
+    path: Path,
+    source_sha: str,
+    target_sha: str,
+    manifest: dict,
+    target: str,
+    failure_stage: str,
+    error: BaseException,
+    observations: dict[str, object],
+) -> dict:
+    evidence = {
+        "schema": "szl.hf-publication-partial/v1",
+        "status": "PARTIAL",
+        "measured": False,
+        "live_success": False,
+        "source_revision": source_sha,
+        "hf_revision": target_sha,
+        "bundle_sha256": manifest["bundle_sha256"],
+        "target": target,
+        "failure_stage": failure_stage,
+        "diagnostic": _sanitized_diagnostic(error),
+        "observations": observations,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(canonical_json(evidence))
+    return evidence
+
+
 def attest_bundle(
     bundle: Path,
     source_sha: str,
@@ -602,68 +855,73 @@ def attest_bundle(
     output_path: Path,
     timeout: int | None = None,
     config_path: Path = DEFAULT_CONFIG,
+    failure_output_path: Path | None = None,
 ) -> dict:
     source_sha = exact_sha(source_sha)
     config = load_config(config_path)
     manifest = validate_bundle(bundle, source_sha, config_path)
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    if result.get("source_revision") != source_sha or result.get("target") != config["target"]:
+    if (
+        result.get("schema") != "szl.hf-deploy-result/v1"
+        or result.get("status") != "PUBLISHED_AWAITING_ATTESTATION"
+        or result.get("source_revision") != source_sha
+        or result.get("target") != config["target"]
+        or result.get("bundle_sha256") != manifest["bundle_sha256"]
+    ):
         raise ContractError("deployment result is not bound to this source and target")
     target_sha = exact_sha(result.get("hf_revision"), "deployment result revision")
     deadline = time.monotonic() + int(timeout or config["wait_running_seconds"])
-    last_stage = last_sha = None
-    while time.monotonic() < deadline:
-        info = _hf_json(f"https://huggingface.co/api/spaces/{config['target']}")
-        last_sha = (info or {}).get("sha")
-        last_stage = ((info or {}).get("runtime") or {}).get("stage")
-        if last_sha == target_sha and last_stage == "RUNNING":
-            break
-        if last_sha == target_sha and last_stage in TERMINAL_STAGES:
-            raise ContractError(f"Space reached {last_stage} at {target_sha}")
-        time.sleep(10)
-    else:
-        raise ContractError(
-            f"Space did not reach exact RUNNING revision {target_sha}; "
-            f"last stage={last_stage!r} sha={last_sha!r}"
-        )
-    tree_url = (
-        f"https://huggingface.co/api/spaces/{config['target']}/tree/{target_sha}"
-        "?recursive=true&expand=false"
+    failure_output_path = failure_output_path or output_path.with_name(
+        "hf-publication-partial.json"
     )
-    tree = _hf_json(tree_url)
-    files_verified = verify_live_tree(bundle, tree, config["allowed_hf_extras"])
-    origin = _static_origin(config["target"])
-    query = urllib.parse.urlencode({"source": source_sha})
-    expected_index = (bundle / "index.html").read_bytes()
-    expected_provenance = (bundle / "SPACE_PROVENANCE.json").read_bytes()
-    public_index_sha256 = None
-    last_error = "not attempted"
-    for attempt in range(12):
-        public_index = _fetch_public_index(origin, source_sha)
-        try:
-            public_index_sha256 = require_exact_public_index(public_index, expected_index)
-        except ContractError as error:
-            last_error = str(error)
-            public_index_sha256 = None
-        provenance_status, provenance_body, provenance_location = _public_response(
-            origin + "/SPACE_PROVENANCE.json?" + query
+    observations: dict[str, object] = {
+        "runtime_stage": None,
+        "runtime_revision": None,
+        "files_verified": None,
+        "public_source_identity": False,
+    }
+    failure_stage = "runtime_readback"
+    try:
+        runtime_stage, runtime_sha = _wait_for_exact_running(
+            config["target"], target_sha, deadline
         )
-        if provenance_location is not None:
-            raise ContractError("public provenance route unexpectedly redirected")
-        if (
-            public_index_sha256 is not None
-            and provenance_status == 200
-            and provenance_body == expected_provenance
-        ):
-            break
-        last_error = (
-            f"{last_error}; provenance={provenance_status}/"
-            f"sha256={sha256_bytes(provenance_body)}"
+        observations["runtime_stage"] = runtime_stage
+        observations["runtime_revision"] = runtime_sha
+        failure_stage = "tree_readback"
+        tree_url = (
+            f"https://huggingface.co/api/spaces/{config['target']}/tree/{target_sha}"
+            "?recursive=true&expand=false"
         )
-        if attempt < 11:
-            time.sleep(5)
-    else:
-        raise ContractError(f"public static source identity did not close: {last_error}")
+        tree = _retry_transient(
+            lambda: _hf_json(tree_url), deadline, "Space tree readback"
+        )
+        files_verified = verify_live_tree(bundle, tree, config["allowed_hf_extras"])
+        observations["files_verified"] = files_verified
+        failure_stage = "public_readback"
+        origin = _static_origin(config["target"])
+        expected_index = (bundle / "index.html").read_bytes()
+        expected_provenance = (bundle / "SPACE_PROVENANCE.json").read_bytes()
+        public_index_sha256 = _read_exact_public_identity(
+            origin, source_sha, expected_index, expected_provenance, deadline
+        )
+        observations["public_source_identity"] = True
+        failure_stage = "post_readback_governance"
+        final_authorization = require_governed_main(source_sha, config_path)
+    except Exception as error:
+        _write_partial_evidence(
+            failure_output_path,
+            source_sha,
+            target_sha,
+            manifest,
+            config["target"],
+            failure_stage,
+            error,
+            observations,
+        )
+        raise ContractError(
+            f"post-publication verification failed closed at {failure_stage}; "
+            "partial evidence was written"
+        ) from error
     attestation = {
         "schema": "szl.hf-live-attestation/v1",
         "status": "MEASURED",
@@ -677,6 +935,7 @@ def attest_bundle(
         "public_index_sha256": public_index_sha256,
         "public_provenance_sha256": sha256_bytes(expected_provenance),
         "target": config["target"],
+        "authorization": final_authorization,
     }
     output_path.write_bytes(canonical_json(attestation))
     return attestation
@@ -706,6 +965,7 @@ def main() -> int:
     attest.add_argument("--source-sha", required=True)
     attest.add_argument("--result", type=Path, required=True)
     attest.add_argument("--output", type=Path, required=True)
+    attest.add_argument("--failure-output", type=Path, required=True)
     attest.add_argument("--timeout", type=int)
     args = parser.parse_args()
     if args.command == "build":
@@ -726,6 +986,7 @@ def main() -> int:
             args.output,
             args.timeout,
             args.config,
+            args.failure_output,
         )
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
     return 0

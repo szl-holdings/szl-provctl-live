@@ -28,22 +28,30 @@ TARGET_SHA = "c" * 40
 
 def strong_ruleset() -> dict:
     return {
-        "id": 7,
+        "id": MODULE.GOVERNED_RULESET_ID,
+        "name": MODULE.GOVERNED_RULESET_NAME,
+        "source": MODULE.GOVERNED_RULESET_SOURCE,
+        "source_type": "Organization",
         "target": "branch",
         "enforcement": "active",
         "bypass_actors": [],
         "conditions": {
-            "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}
+            "repository_id": {
+                "repository_ids": list(MODULE.TARGET_REPOSITORY_IDS.values())
+            },
+            "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
         },
         "rules": [
             {
                 "type": "pull_request",
                 "parameters": {
                     "required_approving_review_count": 0,
-                    "dismiss_stale_reviews_on_push": False,
+                    "dismiss_stale_reviews_on_push": True,
                     "require_code_owner_review": False,
                     "require_last_push_approval": False,
                     "required_review_thread_resolution": True,
+                    "required_reviewers": [],
+                    "allowed_merge_methods": ["squash", "rebase"],
                 },
             },
             {"type": "non_fast_forward"},
@@ -52,6 +60,7 @@ def strong_ruleset() -> dict:
             {
                 "type": "required_status_checks",
                 "parameters": {
+                    "do_not_enforce_on_create": False,
                     "strict_required_status_checks_policy": True,
                     "required_status_checks": [
                         {"context": "validate-static-space", "integration_id": 15368},
@@ -63,34 +72,79 @@ def strong_ruleset() -> dict:
     }
 
 
-def guard_responder(detail: dict):
+def inherited_rules(detail: dict) -> list[dict]:
+    return [
+        {
+            **copy.deepcopy(row),
+            "ruleset_id": MODULE.GOVERNED_RULESET_ID,
+            "ruleset_source": MODULE.GOVERNED_RULESET_SOURCE,
+            "ruleset_source_type": "Organization",
+        }
+        for row in detail["rules"]
+    ]
+
+
+def guard_responder(
+    detail: dict,
+    *,
+    effective: object | None = None,
+    summary: object | None = None,
+    metadata: object | None = None,
+):
     repository = MODULE.load_config()["source_repository"]
+    repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
+    if effective is None:
+        effective = inherited_rules(detail)
+    if summary is None:
+        summary = [
+            {
+                "id": MODULE.GOVERNED_RULESET_ID,
+                "name": MODULE.GOVERNED_RULESET_NAME,
+                "source": MODULE.GOVERNED_RULESET_SOURCE,
+                "source_type": "Organization",
+                "target": "branch",
+                "enforcement": "active",
+            }
+        ]
+    if metadata is None:
+        metadata = {
+            "id": repository_id,
+            "full_name": repository,
+            "default_branch": "main",
+        }
 
     def respond(url: str, token: str = "") -> object:
         if token != "github-test-token":
             raise AssertionError("guard omitted its GitHub credential")
         if url.endswith(f"/repos/{repository}"):
-            return {"default_branch": "main"}
+            return metadata
         if url.endswith(f"/repos/{repository}/branches/main"):
             return {"commit": {"sha": SOURCE_SHA}}
         if url.endswith(f"/repos/{repository}/rulesets?includes_parents=true"):
-            return [{"id": 7, "target": "branch", "enforcement": "active"}]
-        if url.endswith(f"/repos/{repository}/rulesets/7"):
+            return summary
+        if url.endswith(
+            f"/repos/{repository}/rulesets/{MODULE.GOVERNED_RULESET_ID}"
+        ):
             return detail
+        if url.endswith(f"/repos/{repository}/rules/branches/main"):
+            return effective
         raise AssertionError(f"unexpected guard URL: {url}")
 
     return respond
 
 
 class FakeHfApi:
-    def __init__(self, stale: bool = False) -> None:
+    def __init__(self, stale: bool = False, events: list[str] | None = None) -> None:
         self.stale = stale
+        self.events = events if events is not None else []
         self.upload_kwargs: dict | None = None
 
     def space_info(self, target: str, token: str):
+        self.events.append("parent")
         return SimpleNamespace(sha=PARENT_SHA)
 
     def upload_folder(self, **kwargs):
+        self.events.append("upload")
         self.upload_kwargs = kwargs
         if self.stale:
             raise RuntimeError("parent commit changed")
@@ -110,6 +164,22 @@ def live_tree(bundle: Path) -> list[dict]:
             }
         )
     return rows
+
+
+def write_deploy_result(bundle: Path, result_path: Path) -> dict:
+    manifest = MODULE.validate_bundle(bundle, SOURCE_SHA)
+    result = {
+        "schema": "szl.hf-deploy-result/v1",
+        "status": "PUBLISHED_AWAITING_ATTESTATION",
+        "source_revision": SOURCE_SHA,
+        "previous_hf_revision": PARENT_SHA,
+        "hf_revision": TARGET_SHA,
+        "bundle_sha256": manifest["bundle_sha256"],
+        "target": MODULE.load_config()["target"],
+        "authorization": {"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
+    }
+    result_path.write_bytes(MODULE.canonical_json(result))
+    return result
 
 
 class StaticSpaceContractTests(unittest.TestCase):
@@ -172,6 +242,22 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertEqual(packages["huggingface-hub"], "1.19.0")
         self.assertGreaterEqual(len(packages), 20)
 
+    def test_repository_identity_is_one_exact_governed_target(self) -> None:
+        config = MODULE.load_config()
+        expected = {
+            "szl-holdings/lambda-gate-holo": 1295931629,
+            "szl-holdings/governed-norm-holo": 1295931607,
+            "szl-holdings/energy-attest-holo": 1295929955,
+            "szl-holdings/receipt-chain-live": 1295940016,
+            "szl-holdings/szl-provctl-live": 1295941247,
+        }
+        self.assertEqual(MODULE.TARGET_REPOSITORY_IDS, expected)
+        self.assertIn(config["source_repository"], expected)
+        self.assertEqual(
+            config["target"],
+            "SZLHOLDINGS/" + config["source_repository"].split("/", 1)[1],
+        )
+
     def test_guard_authorizes_solo_exact_default_policy(self) -> None:
         repository = MODULE.load_config()["source_repository"]
         environment = {
@@ -186,7 +272,10 @@ class StaticSpaceContractTests(unittest.TestCase):
             ):
                 result = MODULE.require_governed_main(SOURCE_SHA)
         self.assertEqual(result["status"], "AUTHORIZED_EXACT_PROTECTED_MAIN")
-        self.assertEqual(result["ruleset_ids"], [7])
+        self.assertEqual(result["ruleset_ids"], [MODULE.GOVERNED_RULESET_ID])
+        self.assertEqual(
+            result["repository_id"], MODULE.TARGET_REPOSITORY_IDS[repository]
+        )
         self.assertEqual(result["required_status_contexts"], ["DCO", "validate-static-space"])
 
     def test_guard_rejects_weak_rulesets(self) -> None:
@@ -220,8 +309,49 @@ class StaticSpaceContractTests(unittest.TestCase):
                     with mock.patch.object(
                         MODULE, "_request_json", side_effect=guard_responder(detail)
                     ):
-                        with self.assertRaisesRegex(MODULE.ContractError, "lacks one exact"):
+                        with self.assertRaisesRegex(
+                            MODULE.ContractError, "does not match the exact"
+                        ):
                             MODULE.require_governed_main(SOURCE_SHA)
+
+    def test_guard_rejects_substitute_local_or_ineffective_ruleset(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        local = strong_ruleset()
+        local["source"] = repository
+        local["source_type"] = "Repository"
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with mock.patch.object(
+                MODULE, "_request_json", side_effect=guard_responder(local)
+            ):
+                with self.assertRaisesRegex(MODULE.ContractError, "does not match the exact"):
+                    MODULE.require_governed_main(SOURCE_SHA)
+            with mock.patch.object(
+                MODULE,
+                "_request_json",
+                side_effect=guard_responder(strong_ruleset(), effective=[]),
+            ):
+                with self.assertRaisesRegex(MODULE.ContractError, "not fully effective"):
+                    MODULE.require_governed_main(SOURCE_SHA)
+            wrong_metadata = {
+                "id": 1,
+                "full_name": repository,
+                "default_branch": "main",
+            }
+            with mock.patch.object(
+                MODULE,
+                "_request_json",
+                side_effect=guard_responder(
+                    strong_ruleset(), metadata=wrong_metadata
+                ),
+            ):
+                with self.assertRaisesRegex(MODULE.ContractError, "identity"):
+                    MODULE.require_governed_main(SOURCE_SHA)
 
     def test_guard_rejects_status_context_bound_to_wrong_integration(self) -> None:
         repository = MODULE.load_config()["source_repository"]
@@ -240,7 +370,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE, "_request_json", side_effect=guard_responder(detail)
             ):
-                with self.assertRaisesRegex(MODULE.ContractError, "lacks one exact"):
+                with self.assertRaisesRegex(MODULE.ContractError, "does not match the exact"):
                     MODULE.require_governed_main(SOURCE_SHA)
 
     def test_guard_api_error_fails_closed(self) -> None:
@@ -351,6 +481,12 @@ class StaticSpaceContractTests(unittest.TestCase):
             workflow,
         )
         self.assertNotIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
+        self.assertIn('python -I -m venv "$PUBLISHER_VENV"', workflow)
+        self.assertIn('test ! -e "$PUBLISHER_VENV"', workflow)
+        self.assertIn("--require-hashes --only-binary=:all: --ignore-installed", workflow)
+        self.assertIn('"$PUBLISHER_PYTHON" -I scripts/hf_static_space.py deploy', workflow)
+        self.assertIn('"$PUBLISHER_PYTHON" -I scripts/hf_static_space.py attest', workflow)
+        self.assertIn("hf-publication-partial.json", workflow)
 
     def test_deploy_uses_parent_lock_and_full_tree_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -358,13 +494,19 @@ class StaticSpaceContractTests(unittest.TestCase):
             bundle = root / "bundle"
             result_path = root / "result.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
-            api = FakeHfApi()
+            events: list[str] = []
+            api = FakeHfApi(events=events)
             fake_hub = SimpleNamespace(HfApi=lambda token: api)
             authorization = {"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"}
+
+            def authorize(*_args):
+                events.append("guard")
+                return authorization
+
             with mock.patch.dict(os.environ, {"HF_TOKEN": "test-token"}, clear=False):
                 with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
                     with mock.patch.object(
-                        MODULE, "require_governed_main", return_value=authorization
+                        MODULE, "require_governed_main", side_effect=authorize
                     ):
                         result = MODULE.deploy_bundle(bundle, SOURCE_SHA, result_path)
             assert api.upload_kwargs is not None
@@ -373,6 +515,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertEqual(Path(api.upload_kwargs["folder_path"]), bundle)
             self.assertEqual(result["previous_hf_revision"], PARENT_SHA)
             self.assertEqual(result["hf_revision"], TARGET_SHA)
+            self.assertEqual(events, ["parent", "guard", "upload"])
 
     def test_deploy_stale_parent_fails_without_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -447,6 +590,182 @@ class StaticSpaceContractTests(unittest.TestCase):
     def test_public_index_rejects_wrong_bytes(self) -> None:
         with self.assertRaisesRegex(MODULE.ContractError, "public index bytes differ"):
             MODULE.require_exact_public_index(b"wrong", b"expected")
+
+    def test_transient_readback_retries_and_sanitizes_diagnostics(self) -> None:
+        calls = []
+
+        def action():
+            calls.append("attempt")
+            if len(calls) < 3:
+                raise MODULE.TransientReadbackError("token=raw-secret")
+            return "closed"
+
+        with mock.patch.object(MODULE.time, "monotonic", return_value=0.0):
+            with mock.patch.object(MODULE.time, "sleep"):
+                self.assertEqual(MODULE._retry_transient(action, 1.0, "test"), "closed")
+        self.assertEqual(len(calls), 3)
+        diagnostic = MODULE._sanitized_diagnostic(
+            MODULE.TransientReadbackError("token=raw-secret")
+        )
+        self.assertNotIn("raw-secret", diagnostic)
+        self.assertIn("<redacted>", diagnostic)
+
+    def test_terminal_public_bytes_fail_without_retry(self) -> None:
+        with mock.patch.object(
+            MODULE, "_fetch_public_index", return_value=b"wrong"
+        ) as fetch:
+            with mock.patch.object(MODULE, "_public_response") as provenance:
+                with self.assertRaisesRegex(MODULE.ContractError, "bytes differ"):
+                    MODULE._read_exact_public_identity(
+                        "https://szlholdings-example.static.hf.space",
+                        SOURCE_SHA,
+                        b"expected",
+                        b"provenance",
+                        MODULE.time.monotonic() + 10,
+                    )
+        fetch.assert_called_once()
+        provenance.assert_not_called()
+
+    def test_attestation_reauthorizes_after_exact_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            output_path = root / "success.json"
+            partial_path = root / "partial.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            write_deploy_result(bundle, result_path)
+            events: list[str] = []
+
+            def hf_json(url: str):
+                if "/tree/" in url:
+                    events.append("tree")
+                    return live_tree(bundle)
+                events.append("runtime")
+                return {"sha": TARGET_SHA, "runtime": {"stage": "RUNNING"}}
+
+            def public_index(*_args):
+                events.append("index")
+                return (bundle / "index.html").read_bytes()
+
+            def provenance(*_args):
+                events.append("provenance")
+                return 200, (bundle / "SPACE_PROVENANCE.json").read_bytes(), None
+
+            def authorize(*_args):
+                events.append("guard")
+                return {"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"}
+
+            with mock.patch.object(MODULE, "_hf_json", side_effect=hf_json):
+                with mock.patch.object(
+                    MODULE, "_fetch_public_index", side_effect=public_index
+                ):
+                    with mock.patch.object(
+                        MODULE, "_public_response", side_effect=provenance
+                    ):
+                        with mock.patch.object(
+                            MODULE, "require_governed_main", side_effect=authorize
+                        ):
+                            attestation = MODULE.attest_bundle(
+                                bundle,
+                                SOURCE_SHA,
+                                result_path,
+                                output_path,
+                                10,
+                                MODULE.DEFAULT_CONFIG,
+                                partial_path,
+                            )
+            self.assertEqual(attestation["status"], "MEASURED")
+            self.assertEqual(events, ["runtime", "tree", "index", "provenance", "guard"])
+            self.assertTrue(output_path.is_file())
+            self.assertFalse(partial_path.exists())
+
+    def test_post_readback_drift_writes_partial_not_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            output_path = root / "success.json"
+            partial_path = root / "partial.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            write_deploy_result(bundle, result_path)
+
+            def hf_json(url: str):
+                if "/tree/" in url:
+                    return live_tree(bundle)
+                return {"sha": TARGET_SHA, "runtime": {"stage": "RUNNING"}}
+
+            with mock.patch.object(MODULE, "_hf_json", side_effect=hf_json):
+                with mock.patch.object(
+                    MODULE,
+                    "_fetch_public_index",
+                    return_value=(bundle / "index.html").read_bytes(),
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "_public_response",
+                        return_value=(
+                            200,
+                            (bundle / "SPACE_PROVENANCE.json").read_bytes(),
+                            None,
+                        ),
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "require_governed_main",
+                            side_effect=MODULE.ContractError("main drifted"),
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.ContractError, "partial evidence"
+                            ):
+                                MODULE.attest_bundle(
+                                    bundle,
+                                    SOURCE_SHA,
+                                    result_path,
+                                    output_path,
+                                    10,
+                                    MODULE.DEFAULT_CONFIG,
+                                    partial_path,
+                                )
+            partial = json.loads(partial_path.read_text(encoding="utf-8"))
+            self.assertEqual(partial["status"], "PARTIAL")
+            self.assertFalse(partial["measured"])
+            self.assertFalse(partial["live_success"])
+            self.assertEqual(partial["hf_revision"], TARGET_SHA)
+            self.assertEqual(partial["failure_stage"], "post_readback_governance")
+            self.assertFalse(output_path.exists())
+
+    def test_exhausted_runtime_readback_writes_exact_partial_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            output_path = root / "success.json"
+            partial_path = root / "partial.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            write_deploy_result(bundle, result_path)
+            with mock.patch.object(
+                MODULE,
+                "_wait_for_exact_running",
+                side_effect=MODULE.ContractError(
+                    "runtime transient deadline exhausted token=raw-secret"
+                ),
+            ):
+                with self.assertRaisesRegex(MODULE.ContractError, "partial evidence"):
+                    MODULE.attest_bundle(
+                        bundle,
+                        SOURCE_SHA,
+                        result_path,
+                        output_path,
+                        1,
+                        MODULE.DEFAULT_CONFIG,
+                        partial_path,
+                    )
+            partial = json.loads(partial_path.read_text(encoding="utf-8"))
+            self.assertEqual(partial["hf_revision"], TARGET_SHA)
+            self.assertEqual(partial["failure_stage"], "runtime_readback")
+            self.assertNotIn("raw-secret", partial["diagnostic"])
+            self.assertFalse(output_path.exists())
 
 
 if __name__ == "__main__":
