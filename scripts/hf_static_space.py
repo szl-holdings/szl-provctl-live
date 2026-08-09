@@ -270,36 +270,42 @@ def require_governed_main(source_sha: str, config_path: Path = DEFAULT_CONFIG) -
         raise ContractError(
             f"refusing stale release: current main {live_sha!r} != source {source_sha!r}"
         )
-    summaries = _request_json(
-        f"{api_root}/repos/{repository}/rulesets?includes_parents=true", token
+    applicable_rules = _request_json(
+        f"{api_root}/repos/{repository}/rules/branches/main", token
     )
-    if not isinstance(summaries, list):
-        raise ContractError("repository ruleset inventory is unavailable")
-    accepted: list[int] = []
-    for summary in summaries:
-        if not isinstance(summary, dict) or summary.get("enforcement") != "active":
+    if not isinstance(applicable_rules, list):
+        raise ContractError("active rules for main are unavailable")
+    organization = repository.split("/", 1)[0]
+    applicable_by_ruleset: dict[int, set[str]] = {}
+    for rule in applicable_rules:
+        if (
+            not isinstance(rule, dict)
+            or rule.get("ruleset_source_type") != "Organization"
+            or rule.get("ruleset_source") != organization
+        ):
             continue
-        ruleset_id = summary.get("id")
-        if not isinstance(ruleset_id, int):
+        ruleset_id = rule.get("ruleset_id")
+        rule_type = rule.get("type")
+        if isinstance(ruleset_id, int) and isinstance(rule_type, str):
+            applicable_by_ruleset.setdefault(ruleset_id, set()).add(rule_type)
+    accepted: list[int] = []
+    for ruleset_id, rule_types in applicable_by_ruleset.items():
+        if not REQUIRED_RULE_TYPES <= rule_types:
             continue
         detail = _request_json(f"{api_root}/repos/{repository}/rulesets/{ruleset_id}", token)
-        include = (((detail or {}).get("conditions") or {}).get("ref_name") or {}).get(
-            "include", []
-        )
-        rule_types = {
-            row.get("type")
-            for row in (detail or {}).get("rules", [])
-            if isinstance(row, dict)
-        }
         if (
-            "~DEFAULT_BRANCH" in include
-            and REQUIRED_RULE_TYPES <= rule_types
+            isinstance(detail, dict)
+            and detail.get("enforcement") == "active"
+            and detail.get("source_type") == "Organization"
+            and detail.get("source") == organization
             and (detail or {}).get("bypass_actors") == []
+            and detail.get("current_user_can_bypass") == "never"
         ):
             accepted.append(ruleset_id)
     if not accepted:
         raise ContractError(
-            "default branch lacks an active no-bypass PR, non-fast-forward, linear-history ruleset"
+            "default branch lacks an applicable inherited no-bypass PR, non-fast-forward, "
+            "linear-history ruleset"
         )
     return {
         "status": "AUTHORIZED_EXACT_PROTECTED_MAIN",
@@ -368,7 +374,7 @@ def _static_origin(target: str) -> str:
     owner, name = target.split("/", 1)
     owner = re.sub(r"[^a-z0-9-]+", "-", owner.lower()).strip("-")
     name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
-    return f"https://{owner}-{name}.static.hf.space"
+    return f"https://{owner}-{name}.hf.space"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -446,6 +452,8 @@ def attest_bundle(
             raise ContractError(f"live Space bytes differ: {relative}")
     origin = _static_origin(config["target"])
     query = urllib.parse.urlencode({"source": source_sha})
+    expected_ui = (bundle / "index.html").read_bytes()
+    expected_provenance = (bundle / "SPACE_PROVENANCE.json").read_bytes()
     last_error = "not attempted"
     for attempt in range(12):
         status, body = _public_bytes(origin + "/?" + query)
@@ -458,8 +466,9 @@ def attest_bundle(
             provenance = {}
         if (
             status == 200
-            and body
+            and body == expected_ui
             and provenance_status == 200
+            and provenance_body == expected_provenance
             and ((provenance.get("source") or {}).get("revision") == source_sha)
         ):
             break
