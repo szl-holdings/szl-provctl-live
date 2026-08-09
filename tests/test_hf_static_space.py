@@ -870,6 +870,14 @@ class StaticSpaceContractTests(unittest.TestCase):
                                 partial_path,
                             )
             self.assertEqual(attestation["status"], "MEASURED")
+            self.assertEqual(
+                attestation["source"],
+                {
+                    "repository": MODULE.load_config()["source_repository"],
+                    "revision": SOURCE_SHA,
+                    "relation": MODULE.SOURCE_RELATION,
+                },
+            )
             self.assertEqual(events, ["runtime", "tree", "index", "provenance", "guard"])
             self.assertEqual(len(deadlines), 4)
             self.assertEqual(len(set(deadlines)), 1)
@@ -979,6 +987,11 @@ class StaticSpaceContractTests(unittest.TestCase):
             measurement = {
                 "schema": "szl.hf-live-attestation/v2",
                 "status": "MEASURED",
+                "source": {
+                    "repository": MODULE.load_config()["source_repository"],
+                    "revision": SOURCE_SHA,
+                    "relation": MODULE.SOURCE_RELATION,
+                },
                 "source_revision": SOURCE_SHA,
                 "hf_revision": TARGET_SHA,
                 "target": result["target"],
@@ -1011,6 +1024,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                     )
                     self.assertEqual(failure["status"], "WORKFLOW_STAGE_FAILURE")
                     self.assertEqual(failure["failure_stage"], expected_stage)
+                    self.assertEqual(failure["source"], measurement["source"])
                     self.assertEqual(failure["hf_revision"], TARGET_SHA)
                     self.assertFalse(failure["receipt_minted"])
                     self.assertFalse(failure["deployment_success"])
@@ -1036,6 +1050,11 @@ class StaticSpaceContractTests(unittest.TestCase):
             measurement = {
                 "schema": "szl.hf-live-attestation/v2",
                 "status": "MEASURED",
+                "source": {
+                    "repository": MODULE.load_config()["source_repository"],
+                    "revision": SOURCE_SHA,
+                    "relation": MODULE.SOURCE_RELATION,
+                },
                 "source_revision": SOURCE_SHA,
                 "hf_revision": TARGET_SHA,
                 "target": result["target"],
@@ -1059,6 +1078,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                 "https://github.example/attestation",
             )
             self.assertEqual(receipt["status"], "OIDC_ATTESTED_DEPLOYMENT")
+            self.assertEqual(receipt["source"], measurement["source"])
             self.assertEqual(receipt["source_revision"], SOURCE_SHA)
             self.assertEqual(receipt["hf_revision"], TARGET_SHA)
             self.assertEqual(
@@ -1069,6 +1089,109 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertTrue(receipt["deployment_success"])
             self.assertEqual(receipt_path.read_bytes(), MODULE.canonical_json(receipt))
             self.assertFalse(workflow_failure_path.exists())
+
+    def test_workflow_outcome_rejects_invalid_or_cross_repo_source_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            measurement_path = root / "measurement.json"
+            mutation_failure_path = root / "mutation-failure.json"
+            partial_path = root / "partial.json"
+            receipt_path = root / "receipt.json"
+            workflow_failure_path = root / "workflow-failure.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            write_deploy_result(bundle, result_path)
+            config = MODULE.load_config()
+            expected_source = {
+                "repository": config["source_repository"],
+                "revision": SOURCE_SHA,
+                "relation": MODULE.SOURCE_RELATION,
+            }
+            base_measurement = {
+                "schema": "szl.hf-live-attestation/v2",
+                "status": "MEASURED",
+                "source": expected_source,
+                "source_revision": SOURCE_SHA,
+                "hf_revision": TARGET_SHA,
+                "target": config["target"],
+                "receipt_minted": False,
+                "deployment_success": False,
+            }
+            invalid_measurements = {}
+            for field in ("repository", "relation"):
+                missing = copy.deepcopy(base_measurement)
+                del missing["source"][field]
+                invalid_measurements[f"missing_{field}"] = missing
+                wrong = copy.deepcopy(base_measurement)
+                wrong["source"][field] = f"wrong-{field}"
+                invalid_measurements[f"wrong_{field}"] = wrong
+            missing_target = copy.deepcopy(base_measurement)
+            del missing_target["target"]
+            invalid_measurements["missing_target"] = missing_target
+            wrong_target = copy.deepcopy(base_measurement)
+            wrong_target["target"] = "SZLHOLDINGS/wrong-target"
+            invalid_measurements["wrong_target"] = wrong_target
+
+            for case, measurement in invalid_measurements.items():
+                with self.subTest(case=case):
+                    measurement_path.write_bytes(MODULE.canonical_json(measurement))
+                    failure = MODULE.synthesize_workflow_outcome(
+                        SOURCE_SHA,
+                        result_path,
+                        measurement_path,
+                        mutation_failure_path,
+                        partial_path,
+                        receipt_path,
+                        workflow_failure_path,
+                        "success",
+                        "success",
+                        "success",
+                        "success",
+                        "attestation-id",
+                        "https://github.example/attestation",
+                    )
+                    self.assertEqual(failure["failure_stage"], "local_measurement_schema")
+                    self.assertEqual(failure["source"], measurement.get("source"))
+                    self.assertEqual(failure["expected_source"], expected_source)
+                    self.assertFalse(failure["receipt_minted"])
+                    self.assertFalse(failure["deployment_success"])
+                    self.assertFalse(receipt_path.exists())
+
+            cross_repository = next(
+                repository
+                for repository in MODULE.TARGET_REPOSITORY_IDS
+                if repository != config["source_repository"]
+            )
+            cross_config = dict(config)
+            cross_config["source_repository"] = cross_repository
+            cross_config["target"] = "SZLHOLDINGS/" + cross_repository.split("/", 1)[1]
+            cross_config_path = root / "cross-repo-config.json"
+            cross_config_path.write_bytes(MODULE.canonical_json(cross_config))
+            measurement_path.write_bytes(MODULE.canonical_json(base_measurement))
+            failure = MODULE.synthesize_workflow_outcome(
+                SOURCE_SHA,
+                result_path,
+                measurement_path,
+                mutation_failure_path,
+                partial_path,
+                receipt_path,
+                workflow_failure_path,
+                "success",
+                "success",
+                "success",
+                "success",
+                "attestation-id",
+                "https://github.example/attestation",
+                config_path=cross_config_path,
+            )
+            self.assertEqual(failure["failure_stage"], "local_measurement_schema")
+            self.assertEqual(failure["source"], expected_source)
+            self.assertEqual(failure["expected_source"]["repository"], cross_repository)
+            self.assertEqual(failure["expected_target"], cross_config["target"])
+            self.assertFalse(failure["receipt_minted"])
+            self.assertFalse(failure["deployment_success"])
+            self.assertFalse(receipt_path.exists())
 
 
 if __name__ == "__main__":

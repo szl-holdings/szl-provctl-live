@@ -51,6 +51,7 @@ DEPLOY_DEADLINE_SECONDS = 300.0
 MUTATION_READBACK_SECONDS = 90.0
 UA = "szl-hf-static-space/1.0"
 DCO_TRAILER = re.compile(r"^Signed-off-by:\s*(.+?)\s*<([^<>\s]+)>$", re.IGNORECASE)
+SOURCE_RELATION = "source-bound-static-release"
 
 
 class ContractError(RuntimeError):
@@ -87,6 +88,14 @@ def exact_sha(value: str, label: str = "source revision") -> str:
     if not HEX40.fullmatch(normalized):
         raise ContractError(f"{label} must be an exact lowercase 40-character SHA")
     return normalized
+
+
+def _source_identity(config: dict[str, object], source_sha: str) -> dict[str, str]:
+    return {
+        "repository": str(config["source_repository"]),
+        "revision": exact_sha(source_sha),
+        "relation": SOURCE_RELATION,
+    }
 
 
 def _remaining_timeout(deadline: float, cap: float, label: str) -> float:
@@ -305,12 +314,7 @@ def build_bundle(output: Path, source_sha: str, config_path: Path = DEFAULT_CONF
         copied.append(relative)
     provenance = {
         "schema": "szl.deployment-source/v4",
-        "source": {
-            "repository": config["source_repository"],
-            "revision": source_sha,
-            "ref": "refs/heads/main",
-            "relation": "source-bound-static-release",
-        },
+        "source": {**_source_identity(config, source_sha), "ref": "refs/heads/main"},
         "target": {"repo_id": config["target"], "repo_type": "space", "sdk": "static"},
         "claims": {
             "source_file_digests": "MEASURED_IN_WORKFLOW",
@@ -1135,6 +1139,7 @@ def attest_bundle(
         "measured": True,
         "receipt_minted": False,
         "deployment_success": False,
+        "source": _source_identity(config, source_sha),
         "source_revision": source_sha,
         "hf_revision": target_sha,
         "runtime_stage": "RUNNING",
@@ -1178,8 +1183,12 @@ def synthesize_workflow_outcome(
     attestation_id: str = "",
     attestation_url: str = "",
     force_failure_stage: str = "",
+    config_path: Path = DEFAULT_CONFIG,
 ) -> dict:
     source_sha = exact_sha(source_sha)
+    config = load_config(config_path)
+    expected_source = _source_identity(config, source_sha)
+    expected_target = config["target"]
     result = _read_evidence_object(result_path)
     measurement = _read_evidence_object(measurement_path)
     mutation_failure = _read_evidence_object(mutation_failure_path)
@@ -1202,6 +1211,7 @@ def synthesize_workflow_outcome(
         "success_evidence_upload": success_evidence_outcome,
         "oidc_attestation": oidc_outcome,
     }
+    observed_source = measurement.get("source") if measurement else None
     failure_stage = force_failure_stage
     if not failure_stage:
         failure_stage = next(
@@ -1212,8 +1222,10 @@ def synthesize_workflow_outcome(
         not measurement
         or measurement.get("schema") != "szl.hf-live-attestation/v2"
         or measurement.get("status") != "MEASURED"
+        or observed_source != expected_source
         or measurement.get("source_revision") != source_sha
         or measurement.get("hf_revision") != known_revision
+        or measurement.get("target") != expected_target
         or measurement.get("receipt_minted") is not False
         or measurement.get("deployment_success") is not False
     ):
@@ -1225,9 +1237,12 @@ def synthesize_workflow_outcome(
             "schema": "szl.hf-workflow-stage-failure/v1",
             "status": "WORKFLOW_STAGE_FAILURE",
             "failure_stage": failure_stage,
+            "source": observed_source,
+            "expected_source": expected_source,
             "source_revision": source_sha,
             "hf_revision": known_revision,
             "target": target,
+            "expected_target": expected_target,
             "mutation_status": (
                 mutation_failure.get("status") if mutation_failure else None
             ),
@@ -1245,9 +1260,10 @@ def synthesize_workflow_outcome(
     receipt = {
         "schema": "szl.hf-oidc-receipt/v1",
         "status": "OIDC_ATTESTED_DEPLOYMENT",
+        "source": expected_source,
         "source_revision": source_sha,
         "hf_revision": known_revision,
-        "target": target,
+        "target": expected_target,
         "measurement": {
             "path": measurement_path.name,
             "sha256": sha256_bytes(measurement_bytes),
@@ -1352,6 +1368,7 @@ def main() -> int:
             args.attestation_id,
             args.attestation_url,
             args.force_failure_stage,
+            args.config,
         )
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
     return 0
