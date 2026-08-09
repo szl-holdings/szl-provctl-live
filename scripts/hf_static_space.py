@@ -9,6 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -19,9 +20,21 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / ".hf-space.json"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
-REQUIRED_RULE_TYPES = {"pull_request", "non_fast_forward", "required_linear_history"}
+REQUIRED_RULE_TYPES = {
+    "pull_request",
+    "non_fast_forward",
+    "required_linear_history",
+    "required_signatures",
+    "required_status_checks",
+}
+GITHUB_ACTIONS_INTEGRATION_ID = 15368
+REQUIRED_STATUS_CONTEXTS = {
+    "DCO": GITHUB_ACTIONS_INTEGRATION_ID,
+    "validate-static-space": GITHUB_ACTIONS_INTEGRATION_ID,
+}
 TERMINAL_STAGES = {"BUILD_ERROR", "CONFIG_ERROR", "RUNTIME_ERROR"}
 UA = "szl-hf-static-space/1.0"
+DCO_TRAILER = re.compile(r"^Signed-off-by:\s*(.+?)\s*<([^<>\s]+)>$", re.IGNORECASE)
 
 
 class ContractError(RuntimeError):
@@ -50,6 +63,90 @@ def exact_sha(value: str, label: str = "source revision") -> str:
     if not HEX40.fullmatch(normalized):
         raise ContractError(f"{label} must be an exact lowercase 40-character SHA")
     return normalized
+
+
+def _git_output(arguments: list[str]) -> str:
+    executable = os.environ.get("GIT_EXECUTABLE", "git")
+    try:
+        result = subprocess.run(
+            [executable, *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeError, subprocess.CalledProcessError) as error:
+        raise ContractError(
+            f"git command failed closed: {' '.join(arguments[:2])}"
+        ) from error
+    return result.stdout
+
+
+def _normalized_identity(name: str, email: str) -> tuple[str, str]:
+    return " ".join(name.split()).casefold(), email.strip().casefold()
+
+
+def _matching_dco_trailer(
+    message: str,
+    author_name: str,
+    author_email: str,
+    committer_name: str,
+    committer_email: str,
+) -> bool:
+    lines = message.rstrip().splitlines()
+    trailer_block: list[str] = []
+    for line in reversed(lines):
+        if not line.strip():
+            if trailer_block:
+                break
+            continue
+        trailer_block.append(line.strip())
+    trailer_block.reverse()
+    identities = {
+        _normalized_identity(author_name, author_email),
+        _normalized_identity(committer_name, committer_email),
+    }
+    for line in trailer_block:
+        match = DCO_TRAILER.fullmatch(line)
+        if match and _normalized_identity(match.group(1), match.group(2)) in identities:
+            return True
+    return False
+
+
+def validate_dco_range(base_sha: str, head_sha: str) -> dict[str, object]:
+    base_sha = exact_sha(base_sha, "DCO base revision")
+    head_sha = exact_sha(head_sha, "DCO head revision")
+    if base_sha == head_sha:
+        raise ContractError("DCO range contains no commits")
+    _git_output(["merge-base", "--is-ancestor", base_sha, head_sha])
+    revisions = [
+        exact_sha(row.strip(), "DCO commit revision")
+        for row in _git_output(["rev-list", "--reverse", f"{base_sha}..{head_sha}"]).splitlines()
+        if row.strip()
+    ]
+    if not revisions:
+        raise ContractError("DCO range contains no commits")
+    for revision in revisions:
+        metadata = _git_output(
+            [
+                "show",
+                "-s",
+                "--format=%an%x00%ae%x00%cn%x00%ce%x00%B",
+                revision,
+            ]
+        )
+        fields = metadata.split("\0", 4)
+        if len(fields) != 5:
+            raise ContractError(f"DCO metadata is malformed for commit {revision}")
+        if not _matching_dco_trailer(fields[4], *fields[:4]):
+            raise ContractError(f"commit lacks a matching DCO trailer: {revision}")
+    return {
+        "status": "DCO_VALID",
+        "base_revision": base_sha,
+        "head_revision": head_sha,
+        "commit_count": len(revisions),
+        "commits": revisions,
+    }
 
 
 def safe_relative(value: object) -> str:
@@ -244,8 +341,61 @@ def _request_json(url: str, token: str = "") -> object:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except (OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(
+            f"JSON request failed closed for {url}: {type(error).__name__}"
+        ) from error
+
+
+def _ruleset_authorizes_exact_default_branch(detail: object) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    if detail.get("target") != "branch" or detail.get("enforcement") != "active":
+        return False
+    if detail.get("bypass_actors") != []:
+        return False
+    ref_name = ((detail.get("conditions") or {}).get("ref_name") or {})
+    include = ref_name.get("include")
+    exclude = ref_name.get("exclude")
+    if include not in (["~DEFAULT_BRANCH"], ["refs/heads/main"]) or exclude != []:
+        return False
+    rows = detail.get("rules")
+    if not isinstance(rows, list):
+        return False
+    rules = {
+        row.get("type"): row
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("type"), str)
+    }
+    if not REQUIRED_RULE_TYPES <= set(rules):
+        return False
+    pull_parameters = rules["pull_request"].get("parameters") or {}
+    approvals = pull_parameters.get("required_approving_review_count")
+    if type(approvals) is not int or approvals < 0:
+        return False
+    if pull_parameters.get("required_review_thread_resolution") is not True:
+        return False
+    status_parameters = rules["required_status_checks"].get("parameters") or {}
+    if status_parameters.get("strict_required_status_checks_policy") is not True:
+        return False
+    required_checks = status_parameters.get("required_status_checks")
+    if not isinstance(required_checks, list):
+        return False
+    bound_contexts = {
+        row.get("context"): row.get("integration_id")
+        for row in required_checks
+        if isinstance(row, dict)
+        and isinstance(row.get("context"), str)
+        and type(row.get("integration_id")) is int
+        and row["integration_id"] > 0
+    }
+    return all(
+        bound_contexts.get(context) == integration_id
+        for context, integration_id in REQUIRED_STATUS_CONTEXTS.items()
+    )
 
 
 def require_governed_main(source_sha: str, config_path: Path = DEFAULT_CONFIG) -> dict:
@@ -277,34 +427,29 @@ def require_governed_main(source_sha: str, config_path: Path = DEFAULT_CONFIG) -
         raise ContractError("repository ruleset inventory is unavailable")
     accepted: list[int] = []
     for summary in summaries:
-        if not isinstance(summary, dict) or summary.get("enforcement") != "active":
+        if (
+            not isinstance(summary, dict)
+            or summary.get("enforcement") != "active"
+            or summary.get("target") != "branch"
+        ):
             continue
         ruleset_id = summary.get("id")
         if not isinstance(ruleset_id, int):
             continue
         detail = _request_json(f"{api_root}/repos/{repository}/rulesets/{ruleset_id}", token)
-        include = (((detail or {}).get("conditions") or {}).get("ref_name") or {}).get(
-            "include", []
-        )
-        rule_types = {
-            row.get("type")
-            for row in (detail or {}).get("rules", [])
-            if isinstance(row, dict)
-        }
-        if (
-            "~DEFAULT_BRANCH" in include
-            and REQUIRED_RULE_TYPES <= rule_types
-            and (detail or {}).get("bypass_actors") == []
-        ):
+        if _ruleset_authorizes_exact_default_branch(detail):
             accepted.append(ruleset_id)
     if not accepted:
         raise ContractError(
-            "default branch lacks an active no-bypass PR, non-fast-forward, linear-history ruleset"
+            "default branch lacks one exact no-bypass ruleset requiring signatures, "
+            "strict integration-bound validator/DCO checks, thread resolution, "
+            "non-fast-forward protection, and linear history"
         )
     return {
         "status": "AUTHORIZED_EXACT_PROTECTED_MAIN",
         "source_revision": source_sha,
         "ruleset_ids": accepted,
+        "required_status_contexts": sorted(REQUIRED_STATUS_CONTEXTS),
     }
 
 
@@ -376,14 +521,78 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _public_bytes(url: str) -> tuple[int, bytes]:
+def _public_response(url: str) -> tuple[int, bytes, str | None]:
     request = urllib.request.Request(url, headers={"User-Agent": UA})
     opener = urllib.request.build_opener(_NoRedirect())
     try:
         with opener.open(request, timeout=30) as response:
-            return response.status, response.read()
+            return response.status, response.read(), response.headers.get("Location")
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        location = error.headers.get("Location") if error.headers is not None else None
+        return error.code, error.read(), location
+
+
+def _fetch_public_index(origin: str, source_sha: str) -> bytes:
+    source_sha = exact_sha(source_sha)
+    query = urllib.parse.urlencode({"source": source_sha})
+    root_url = origin + "/?" + query
+    status, _, location = _public_response(root_url)
+    if status != 302 or not location:
+        raise ContractError(f"public static root expected one 302 redirect, observed {status}")
+    redirected = urllib.parse.urljoin(root_url, location)
+    expected_origin = urllib.parse.urlsplit(origin)
+    actual = urllib.parse.urlsplit(redirected)
+    if (
+        actual.scheme.lower() != expected_origin.scheme.lower()
+        or actual.netloc.lower() != expected_origin.netloc.lower()
+        or actual.path != "/index.html"
+        or actual.query != query
+        or actual.fragment
+    ):
+        raise ContractError(f"public static root returned an unsafe redirect: {location!r}")
+    index_status, body, second_location = _public_response(redirected)
+    if index_status != 200 or second_location is not None:
+        raise ContractError(
+            f"public index expected terminal 200 without redirect, observed {index_status}"
+        )
+    return body
+
+
+def require_exact_public_index(actual: bytes, expected: bytes) -> str:
+    actual_digest = sha256_bytes(actual)
+    expected_digest = sha256_bytes(expected)
+    if actual != expected or actual_digest != expected_digest:
+        raise ContractError(
+            f"public index bytes differ: expected sha256={expected_digest} "
+            f"observed sha256={actual_digest}"
+        )
+    return expected_digest
+
+
+def verify_live_tree(bundle: Path, tree: object, allowed_extras: list[str]) -> int:
+    if not isinstance(tree, list):
+        raise ContractError("Hugging Face tree response is malformed")
+    live = {
+        row["path"]: row
+        for row in tree
+        if isinstance(row, dict) and row.get("type") == "file" and "path" in row
+    }
+    expected_paths = {
+        path.relative_to(bundle).as_posix()
+        for path in bundle.rglob("*")
+        if path.is_file()
+    }
+    extras = set(live) - expected_paths
+    if extras - set(allowed_extras):
+        raise ContractError(f"unmanaged files remain in live Space: {sorted(extras)}")
+    if expected_paths - set(live):
+        raise ContractError(f"live Space is missing files: {sorted(expected_paths - set(live))}")
+    for relative in sorted(expected_paths):
+        data = (bundle / relative).read_bytes()
+        row = live[relative]
+        if row.get("oid") != git_blob_sha1(data) or row.get("size") != len(data):
+            raise ContractError(f"live Space bytes differ: {relative}")
+    return len(expected_paths)
 
 
 def attest_bundle(
@@ -422,50 +631,34 @@ def attest_bundle(
         "?recursive=true&expand=false"
     )
     tree = _hf_json(tree_url)
-    if not isinstance(tree, list):
-        raise ContractError("Hugging Face tree response is malformed")
-    live = {
-        row["path"]: row
-        for row in tree
-        if isinstance(row, dict) and row.get("type") == "file"
-    }
-    expected_paths = {
-        path.relative_to(bundle).as_posix()
-        for path in bundle.rglob("*")
-        if path.is_file()
-    }
-    extras = set(live) - expected_paths
-    if extras - set(config["allowed_hf_extras"]):
-        raise ContractError(f"unmanaged files remain in live Space: {sorted(extras)}")
-    if expected_paths - set(live):
-        raise ContractError(f"live Space is missing files: {sorted(expected_paths - set(live))}")
-    for relative in sorted(expected_paths):
-        data = (bundle / relative).read_bytes()
-        row = live[relative]
-        if row.get("oid") != git_blob_sha1(data) or row.get("size") != len(data):
-            raise ContractError(f"live Space bytes differ: {relative}")
+    files_verified = verify_live_tree(bundle, tree, config["allowed_hf_extras"])
     origin = _static_origin(config["target"])
     query = urllib.parse.urlencode({"source": source_sha})
+    expected_index = (bundle / "index.html").read_bytes()
+    expected_provenance = (bundle / "SPACE_PROVENANCE.json").read_bytes()
+    public_index_sha256 = None
     last_error = "not attempted"
     for attempt in range(12):
-        status, body = _public_bytes(origin + "/?" + query)
-        provenance_status, provenance_body = _public_bytes(
+        public_index = _fetch_public_index(origin, source_sha)
+        try:
+            public_index_sha256 = require_exact_public_index(public_index, expected_index)
+        except ContractError as error:
+            last_error = str(error)
+            public_index_sha256 = None
+        provenance_status, provenance_body, provenance_location = _public_response(
             origin + "/SPACE_PROVENANCE.json?" + query
         )
-        try:
-            provenance = json.loads(provenance_body)
-        except json.JSONDecodeError:
-            provenance = {}
+        if provenance_location is not None:
+            raise ContractError("public provenance route unexpectedly redirected")
         if (
-            status == 200
-            and body
+            public_index_sha256 is not None
             and provenance_status == 200
-            and ((provenance.get("source") or {}).get("revision") == source_sha)
+            and provenance_body == expected_provenance
         ):
             break
         last_error = (
-            f"ui={status}/{len(body)} provenance={provenance_status}/"
-            f"{(provenance.get('source') or {}).get('revision')!r}"
+            f"{last_error}; provenance={provenance_status}/"
+            f"sha256={sha256_bytes(provenance_body)}"
         )
         if attempt < 11:
             time.sleep(5)
@@ -478,8 +671,11 @@ def attest_bundle(
         "hf_revision": target_sha,
         "runtime_stage": "RUNNING",
         "bundle_sha256": manifest["bundle_sha256"],
-        "files_verified": len(expected_paths),
+        "files_verified": files_verified,
         "public_source_identity": True,
+        "public_index_bytes": len(expected_index),
+        "public_index_sha256": public_index_sha256,
+        "public_provenance_sha256": sha256_bytes(expected_provenance),
         "target": config["target"],
     }
     output_path.write_bytes(canonical_json(attestation))
@@ -498,6 +694,9 @@ def main() -> int:
     validate.add_argument("--source-sha", required=True)
     guard = subparsers.add_parser("guard")
     guard.add_argument("--source-sha", required=True)
+    dco = subparsers.add_parser("dco")
+    dco.add_argument("--base-sha", required=True)
+    dco.add_argument("--head-sha", required=True)
     deploy = subparsers.add_parser("deploy")
     deploy.add_argument("--bundle", type=Path, required=True)
     deploy.add_argument("--source-sha", required=True)
@@ -515,6 +714,8 @@ def main() -> int:
         value = validate_bundle(args.bundle, args.source_sha, args.config)
     elif args.command == "guard":
         value = require_governed_main(args.source_sha, args.config)
+    elif args.command == "dco":
+        value = validate_dco_range(args.base_sha, args.head_sha)
     elif args.command == "deploy":
         value = deploy_bundle(args.bundle, args.source_sha, args.result, args.config)
     else:

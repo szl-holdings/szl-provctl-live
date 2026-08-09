@@ -31,13 +31,16 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
       - name: Verify exact checkout and release contracts
         env:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python -m pip install --disable-pip-version-check --dry-run --ignore-installed \
+            --only-binary=:all: --require-hashes \
+            -r requirements/hf-publisher.lock
           python -m unittest discover -s tests -v
           python scripts/hf_static_space.py build \
             --source-sha "$SOURCE_SHA" \
@@ -46,10 +49,40 @@ jobs:
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/hf-static-space"
 
+  dco:
+    name: DCO
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout exact event head with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up exact Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+      - name: Validate every exact-range commit DCO trailer
+        env:
+          DCO_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$DCO_HEAD_SHA"
+          python scripts/hf_static_space.py dco \
+            --base-sha "$DCO_BASE_SHA" \
+            --head-sha "$DCO_HEAD_SHA"
+
   deploy:
     name: publish-exact-protected-main
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: validate
+    needs: [validate, dco]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -66,7 +99,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
       - name: Build and validate exact source-bound bundle
         env:
           SOURCE_SHA: ${{ github.sha }}
@@ -85,7 +118,9 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: python scripts/hf_static_space.py guard --source-sha "$SOURCE_SHA"
       - name: Install pinned Hugging Face client without credentials
-        run: python -m pip install --disable-pip-version-check "huggingface_hub==1.19.0"
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: \
+            --require-hashes -r requirements/hf-publisher.lock
       - name: Publish exact bundle with optimistic target lock
         env:
           GITHUB_TOKEN: ${{ github.token }}
