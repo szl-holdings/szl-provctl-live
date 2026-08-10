@@ -517,6 +517,10 @@ class StaticSpaceContractTests(unittest.TestCase):
             jobs["attest"]["permissions"],
             {"attestations": "write", "contents": "read", "id-token": "write"},
         )
+        self.assertEqual(
+            jobs["attest"]["if"],
+            "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        )
         authorize_text = json.dumps(jobs["authorize"], sort_keys=True)
         deploy_text = json.dumps(jobs["deploy"], sort_keys=True)
         measure_text = json.dumps(jobs["measure"], sort_keys=True)
