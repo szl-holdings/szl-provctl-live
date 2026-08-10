@@ -466,24 +466,25 @@ class StaticSpaceContractTests(unittest.TestCase):
             "format('pr-{0}', github.event.pull_request.number) || 'production'",
             workflow,
         )
-        self.assertIn(
-            "actions/create-github-app-token@"
-            "bcd2ba49218906704ab6c1aa796996da409d3eb1",
-            workflow,
-        )
-        self.assertIn("permission-administration: read", workflow)
-        self.assertIn("permission-contents: read", workflow)
-        self.assertIn('test -n "$GOVERNANCE_TOKEN"', workflow)
-        token = workflow.index("Mint least-privilege governed ruleset reader")
+        self.assertNotIn("actions/create-github-app-token@", workflow)
+        self.assertNotIn("QILLQAQ_CLIENT_ID", workflow)
+        self.assertNotIn("QILLQAQ_PRIVATE_KEY", workflow)
+        self.assertNotIn("permission-administration: read", workflow)
+        self.assertNotIn("GOVERNANCE_TOKEN", workflow)
         guard = workflow.index("Reauthorize exact governed main without HF credentials")
         hf_credential = workflow.index("HF_TOKEN: ${{ secrets.HF_TOKEN }}")
-        self.assertLess(token, guard)
         self.assertLess(guard, hf_credential)
-        self.assertIn(
-            "GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}",
-            workflow,
+        self.assertEqual(
+            workflow.count("GITHUB_TOKEN: ${{ github.token }}"),
+            3,
         )
-        self.assertNotIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
+        self.assertNotIn("steps.governance-token.outputs.token", workflow)
+        self.assertIn("env:\n      PUBLISHER_PYTHON: python\n", workflow)
+        fallback = workflow.index("PUBLISHER_PYTHON: python")
+        install = workflow.index("Install pinned Hugging Face client")
+        outcome = workflow.index("Synthesize final receipt or workflow-stage failure")
+        self.assertLess(fallback, install)
+        self.assertLess(fallback, outcome)
         self.assertIn('python -I -m venv "$VALIDATOR_VENV"', workflow)
         self.assertIn('test ! -e "$VALIDATOR_VENV"', workflow)
         self.assertIn('python -I -m venv "$PUBLISHER_VENV"', workflow)
