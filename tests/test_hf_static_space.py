@@ -663,6 +663,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             },
         )
         self.assertEqual(jobs["deploy"]["permissions"], {})
+        self.assertEqual(jobs["measure"]["timeout-minutes"], 20)
         self.assertEqual(
             jobs["attest"]["permissions"],
             {"attestations": "write", "contents": "read", "id-token": "write"},
@@ -675,6 +676,40 @@ class StaticSpaceContractTests(unittest.TestCase):
         deploy_text = json.dumps(jobs["deploy"], sort_keys=True)
         measure_text = json.dumps(jobs["measure"], sort_keys=True)
         attest_text = json.dumps(jobs["attest"], sort_keys=True)
+        authorize_steps = {
+            step.get("id"): step for step in jobs["authorize"]["steps"] if step.get("id")
+        }
+        deploy_steps = {
+            step.get("id"): step for step in jobs["deploy"]["steps"] if step.get("id")
+        }
+        attest_steps = {
+            step.get("id"): step for step in jobs["attest"]["steps"] if step.get("id")
+        }
+        self.assertEqual(
+            jobs["authorize"]["outputs"]["authorization-evidence-outcome"],
+            "${{ steps.authorization-evidence.outcome }}",
+        )
+        self.assertIs(
+            authorize_steps["publisher-input-evidence"]["with"]["include-hidden-files"],
+            True,
+        )
+        self.assertIn("needs.authorize.result == 'success'", jobs["deploy"]["if"])
+        self.assertIn(
+            "needs.authorize.outputs.authorization-evidence-outcome == 'success'",
+            jobs["deploy"]["if"],
+        )
+        self.assertIn(
+            'mkdir -p "$RUNNER_TEMP/publication-evidence"',
+            deploy_steps["publisher-environment"]["run"],
+        )
+        self.assertIn(
+            "steps.publisher-evidence-download.outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
+        self.assertIn(
+            "steps.measurement-evidence-download.outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
         self.assertNotIn("HF_TOKEN", authorize_text)
         self.assertIn("requirements/hf-validator.lock", validate_text)
         self.assertNotIn("requirements/hf-publisher.lock", validate_text)
@@ -698,8 +733,11 @@ class StaticSpaceContractTests(unittest.TestCase):
             2,
         )
         self.assertIn("--authorization-outcome", workflow)
+        self.assertIn("--authorization-evidence-outcome", workflow)
         self.assertIn("--publisher-environment-outcome", workflow)
         self.assertIn("--publisher-evidence-outcome", workflow)
+        self.assertIn("--publisher-evidence-download-outcome", workflow)
+        self.assertIn("--measurement-evidence-download-outcome", workflow)
         self.assertIn("--authorization", workflow)
         self.assertIn("--authorization-output", workflow)
         self.assertIn("Require terminal governed success", workflow)
@@ -1252,9 +1290,21 @@ class StaticSpaceContractTests(unittest.TestCase):
     def test_upstream_stage_outcomes_are_classified_before_mutation(self) -> None:
         cases = (
             ({"authorization_outcome": "failure"}, "governance_authorization"),
+            (
+                {"authorization_evidence_outcome": "failure"},
+                "governance_authorization_evidence",
+            ),
             ({"publisher_input_outcome": "failure"}, "publisher_input"),
             ({"publisher_environment_outcome": "failure"}, "publisher_environment"),
             ({"publisher_evidence_outcome": "failure"}, "publisher_evidence_upload"),
+            (
+                {"publisher_evidence_download_outcome": "failure"},
+                "publisher_evidence_download",
+            ),
+            (
+                {"measurement_evidence_download_outcome": "failure"},
+                "measurement_evidence_download",
+            ),
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

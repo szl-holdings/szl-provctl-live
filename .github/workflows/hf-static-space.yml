@@ -100,6 +100,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       authorization-outcome: ${{ steps.authorization.outcome }}
+      authorization-evidence-outcome: ${{ steps.authorization-evidence.outcome }}
       bundle-outcome: ${{ steps.bundle.outcome }}
       publisher-input-outcome: ${{ steps.publisher-input.outcome }}
       publisher-input-evidence-outcome: ${{ steps.publisher-input-evidence.outcome }}
@@ -167,6 +168,7 @@ jobs:
         with:
           name: hf-static-space-publisher-input-${{ github.sha }}
           path: ${{ runner.temp }}/publisher-input
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
       - name: Upload governed-merge authorization evidence
@@ -193,7 +195,7 @@ jobs:
 
   deploy:
     name: publish-exact-protected-main
-    if: always() && needs.authorize.outputs.authorization-outcome == 'success' && needs.authorize.outputs.publisher-input-evidence-outcome == 'success'
+    if: always() && needs.authorize.result == 'success' && needs.authorize.outputs.authorization-outcome == 'success' && needs.authorize.outputs.authorization-evidence-outcome == 'success' && needs.authorize.outputs.publisher-input-evidence-outcome == 'success'
     needs: [authorize]
     permissions: {}
     runs-on: ubuntu-latest
@@ -231,6 +233,7 @@ jobs:
           PUBLISHER_VENV: ${{ runner.temp }}/hf-publisher-venv
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/publication-evidence"
           test "$(python -I -c 'import platform; print(platform.python_version())')" = "3.12.13"
           test ! -e "$PUBLISHER_VENV"
           python -I -m venv "$PUBLISHER_VENV"
@@ -294,7 +297,7 @@ jobs:
       contents: read
       pull-requests: read
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     outputs:
       measurement-outcome: ${{ steps.measurement.outcome }}
       measurement-evidence-outcome: ${{ steps.measurement-evidence.outcome }}
@@ -395,7 +398,7 @@ jobs:
           path: ${{ runner.temp }}/measurement-evidence
       - name: Attest canonical exact-revision measurement with GitHub OIDC
         id: oidc
-        if: needs.measure.outputs.measurement-outcome == 'success' && needs.measure.outputs.measurement-evidence-outcome == 'success' && steps.measurement-evidence-download.outcome == 'success'
+        if: needs.measure.outputs.measurement-outcome == 'success' && needs.measure.outputs.measurement-evidence-outcome == 'success' && steps.publisher-evidence-download.outcome == 'success' && steps.measurement-evidence-download.outcome == 'success'
         continue-on-error: true
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
@@ -419,12 +422,15 @@ jobs:
             --receipt "$RUNNER_TEMP/terminal-evidence/hf-oidc-receipt.json" \
             --workflow-failure "$RUNNER_TEMP/terminal-evidence/hf-workflow-stage-failure.json" \
             --authorization-outcome "${{ needs.authorize.outputs.authorization-outcome }}" \
+            --authorization-evidence-outcome "${{ needs.authorize.outputs.authorization-evidence-outcome }}" \
             --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
             --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
             --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
             --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
+            --publisher-evidence-download-outcome "${{ steps.publisher-evidence-download.outcome }}" \
             --measurement-outcome "${{ needs.measure.outputs.measurement-outcome }}" \
             --success-evidence-outcome "${{ needs.measure.outputs.measurement-evidence-outcome }}" \
+            --measurement-evidence-download-outcome "${{ steps.measurement-evidence-download.outcome }}" \
             --oidc-outcome "${{ steps.oidc.outcome }}" \
             --attestation-id "$ATTESTATION_ID" \
             --attestation-url "$ATTESTATION_URL"
@@ -457,9 +463,16 @@ jobs:
             --partial "$RUNNER_TEMP/measurement-evidence/hf-publication-partial.json" \
             --receipt "$RUNNER_TEMP/terminal-evidence/hf-oidc-receipt.json" \
             --workflow-failure "$RUNNER_TEMP/terminal-evidence/hf-workflow-stage-failure.json" \
+            --authorization-outcome "${{ needs.authorize.outputs.authorization-outcome }}" \
+            --authorization-evidence-outcome "${{ needs.authorize.outputs.authorization-evidence-outcome }}" \
+            --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
+            --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
             --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
+            --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
+            --publisher-evidence-download-outcome "${{ steps.publisher-evidence-download.outcome }}" \
             --measurement-outcome "${{ needs.measure.outputs.measurement-outcome }}" \
             --success-evidence-outcome "${{ needs.measure.outputs.measurement-evidence-outcome }}" \
+            --measurement-evidence-download-outcome "${{ steps.measurement-evidence-download.outcome }}" \
             --oidc-outcome "${{ steps.oidc.outcome }}" \
             --force-failure-stage terminal_evidence_upload
       - name: Upload terminal failure evidence
@@ -476,12 +489,15 @@ jobs:
         run: |
           set -euo pipefail
           test "${{ needs.authorize.outputs.authorization-outcome }}" = "success"
+          test "${{ needs.authorize.outputs.authorization-evidence-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-input-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-environment-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publish-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-evidence-outcome }}" = "success"
+          test "${{ steps.publisher-evidence-download.outcome }}" = "success"
           test "${{ needs.measure.outputs.measurement-outcome }}" = "success"
           test "${{ needs.measure.outputs.measurement-evidence-outcome }}" = "success"
+          test "${{ steps.measurement-evidence-download.outcome }}" = "success"
           test "${{ steps.oidc.outcome }}" = "success"
           test "${{ steps.terminal-evidence.outcome }}" = "success"
           test -f "$RUNNER_TEMP/terminal-evidence/hf-oidc-receipt.json"

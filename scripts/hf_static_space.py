@@ -1610,9 +1610,12 @@ def synthesize_workflow_outcome(
     config_path: Path = DEFAULT_CONFIG,
     *,
     authorization_outcome: str = "success",
+    authorization_evidence_outcome: str = "success",
     publisher_input_outcome: str = "success",
     publisher_environment_outcome: str = "success",
     publisher_evidence_outcome: str = "success",
+    publisher_evidence_download_outcome: str = "success",
+    measurement_evidence_download_outcome: str = "success",
 ) -> dict:
     source_sha = exact_sha(source_sha)
     config = load_config(config_path)
@@ -1636,12 +1639,15 @@ def synthesize_workflow_outcome(
             break
     outcomes = {
         "governance_authorization": authorization_outcome,
+        "governance_authorization_evidence": authorization_evidence_outcome,
         "publisher_input": publisher_input_outcome,
         "publisher_environment": publisher_environment_outcome,
         "publisher_mutation": publish_outcome,
         "publisher_evidence_upload": publisher_evidence_outcome,
+        "publisher_evidence_download": publisher_evidence_download_outcome,
         "local_measurement": measurement_outcome,
         "measurement_evidence_upload": success_evidence_outcome,
+        "measurement_evidence_download": measurement_evidence_download_outcome,
         "oidc_attestation": oidc_outcome,
     }
     observed_source = measurement.get("source") if measurement else None
@@ -1767,9 +1773,12 @@ def main() -> int:
     outcome.add_argument("--success-evidence-outcome", required=True)
     outcome.add_argument("--oidc-outcome", required=True)
     outcome.add_argument("--authorization-outcome", default="success")
+    outcome.add_argument("--authorization-evidence-outcome", default="success")
     outcome.add_argument("--publisher-input-outcome", default="success")
     outcome.add_argument("--publisher-environment-outcome", default="success")
     outcome.add_argument("--publisher-evidence-outcome", default="success")
+    outcome.add_argument("--publisher-evidence-download-outcome", default="success")
+    outcome.add_argument("--measurement-evidence-download-outcome", default="success")
     outcome.add_argument("--attestation-id", default="")
     outcome.add_argument("--attestation-url", default="")
     outcome.add_argument("--force-failure-stage", default="")
@@ -1832,9 +1841,12 @@ def main() -> int:
             args.force_failure_stage,
             args.config,
             authorization_outcome=args.authorization_outcome,
+            authorization_evidence_outcome=args.authorization_evidence_outcome,
             publisher_input_outcome=args.publisher_input_outcome,
             publisher_environment_outcome=args.publisher_environment_outcome,
             publisher_evidence_outcome=args.publisher_evidence_outcome,
+            publisher_evidence_download_outcome=args.publisher_evidence_download_outcome,
+            measurement_evidence_download_outcome=args.measurement_evidence_download_outcome,
         )
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
     return 0
