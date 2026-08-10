@@ -36,12 +36,21 @@ TARGET_REQUIRED_WORKFLOW_IDS = {
     "szl-holdings/receipt-chain-live": 330468896,
     "szl-holdings/szl-provctl-live": 330468912,
 }
+TARGET_RELEASE_WORKFLOW_IDS = {
+    "szl-holdings/lambda-gate-holo": 330179530,
+    "szl-holdings/governed-norm-holo": 330179524,
+    "szl-holdings/energy-attest-holo": 330179529,
+    "szl-holdings/receipt-chain-live": 330179521,
+    "szl-holdings/szl-provctl-live": 330179528,
+}
 REQUIRED_STATUS_CONTEXTS = {
     "DCO": GITHUB_ACTIONS_INTEGRATION_ID,
     "validate-static-space": GITHUB_ACTIONS_INTEGRATION_ID,
 }
 REQUIRED_WORKFLOW_NAME = "External release boundary"
 REQUIRED_WORKFLOW_PATH = ".github/workflows/release-boundary-required.yml"
+RELEASE_WORKFLOW_NAME = "Governed static Space release"
+RELEASE_WORKFLOW_PATH = ".github/workflows/hf-static-space.yml"
 TERMINAL_STAGES = {"BUILD_ERROR", "CONFIG_ERROR", "RUNTIME_ERROR"}
 TRANSIENT_HTTP_STATUSES = frozenset({429} | set(range(500, 600)))
 HF_REQUEST_TIMEOUT_CAP = 45.0
@@ -427,25 +436,66 @@ def _load_event(path: Path) -> dict:
     return value
 
 
-def _require_successful_checks(rows: object, head_sha: str) -> list[dict]:
-    if not isinstance(rows, dict) or not isinstance(rows.get("check_runs"), list):
-        raise ContractError("exact-head check-run inventory is unavailable")
+def _complete_inventory(rows: object, key: str, label: str) -> list[dict]:
+    if not isinstance(rows, dict) or not isinstance(rows.get(key), list):
+        raise ContractError(f"{label} inventory is unavailable")
+    items = rows[key]
+    total_count = rows.get("total_count")
+    if (
+        type(total_count) is not int
+        or total_count != len(items)
+        or total_count > 100
+        or any(not isinstance(item, dict) for item in items)
+    ):
+        raise ContractError(f"{label} inventory is incomplete or malformed")
+    return items
+
+
+def _exact_job_url(value: object, repository: str, run_id: int, job_id: int) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == "github.com"
+        and parsed.path
+        == f"/{repository}/actions/runs/{run_id}/job/{job_id}"
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _require_successful_checks(
+    rows: object, repository: str, head_sha: str, release_run_id: int
+) -> list[dict]:
+    check_runs = _complete_inventory(rows, "check_runs", "exact-head check-run")
     evidence: list[dict] = []
     for name, integration_id in sorted(REQUIRED_STATUS_CONTEXTS.items()):
         matches = [
             row
-            for row in rows["check_runs"]
-            if isinstance(row, dict)
-            and row.get("name") == name
+            for row in check_runs
+            if row.get("name") == name
             and row.get("head_sha") == head_sha
-            and row.get("status") == "completed"
-            and row.get("conclusion") == "success"
             and isinstance(row.get("app"), dict)
             and row["app"].get("id") == integration_id
+            and type(row.get("id")) is int
+            and row["id"] > 0
+            and _exact_job_url(
+                row.get("details_url"), repository, release_run_id, row["id"]
+            )
         ]
         if not matches:
-            raise ContractError(f"required exact-head check did not succeed: {name}")
-        selected = max(matches, key=lambda row: int(row.get("id") or 0))
+            raise ContractError(
+                f"required exact publisher-workflow check is unavailable: {name}"
+            )
+        selected = max(matches, key=lambda row: row["id"])
+        if (
+            selected.get("status") != "completed"
+            or selected.get("conclusion") != "success"
+        ):
+            raise ContractError(
+                f"latest exact publisher-workflow check did not succeed: {name}"
+            )
         evidence.append(
             {
                 "app_id": integration_id,
@@ -453,45 +503,139 @@ def _require_successful_checks(rows: object, head_sha: str) -> list[dict]:
                 "conclusion": "success",
                 "head_revision": head_sha,
                 "name": name,
+                "workflow_run_id": release_run_id,
             }
         )
     return evidence
 
 
-def _require_boundary_workflow(
-    rows: object, repository: str, head_sha: str
+def _require_exact_pull_request_workflow(
+    rows: object,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+    *,
+    workflow_id: int,
+    workflow_name: str,
+    workflow_path: str,
+    label: str,
 ) -> dict[str, object]:
-    expected_id = TARGET_REQUIRED_WORKFLOW_IDS[repository]
-    if not isinstance(rows, dict) or not isinstance(rows.get("workflow_runs"), list):
-        raise ContractError("required-workflow run inventory is unavailable")
+    workflow_runs = _complete_inventory(rows, "workflow_runs", "workflow-run")
     matches = [
         row
-        for row in rows["workflow_runs"]
-        if isinstance(row, dict)
-        and row.get("workflow_id") == expected_id
-        and row.get("name") == REQUIRED_WORKFLOW_NAME
-        and row.get("path") == REQUIRED_WORKFLOW_PATH
+        for row in workflow_runs
+        if row.get("workflow_id") == workflow_id
+        and row.get("name") == workflow_name
+        and row.get("path") == workflow_path
         and row.get("event") == "pull_request"
         and row.get("head_sha") == head_sha
-        and row.get("status") == "completed"
-        and row.get("conclusion") == "success"
         and isinstance(row.get("repository"), dict)
         and row["repository"].get("full_name") == repository
+        and row["repository"].get("id") == repository_id
     ]
     if not matches:
-        raise ContractError("exact required release-boundary workflow did not succeed")
-    selected = max(matches, key=lambda row: int(row.get("id") or 0))
+        raise ContractError(f"exact {label} did not run for this head")
+    if any(
+        type(row.get("id")) is not int
+        or row["id"] <= 0
+        or type(row.get("run_attempt")) is not int
+        or row["run_attempt"] <= 0
+        for row in matches
+    ):
+        raise ContractError(f"exact {label} identity is malformed")
+    selected = max(matches, key=lambda row: row["id"])
+    pull_requests = selected.get("pull_requests")
+    if not isinstance(pull_requests, list) or len(pull_requests) != 1:
+        raise ContractError(f"exact {label} is not bound to one pull request")
+    run_pull = pull_requests[0]
+    run_head = run_pull.get("head") if isinstance(run_pull, dict) else None
+    run_base = run_pull.get("base") if isinstance(run_pull, dict) else None
+    if (
+        not isinstance(run_pull, dict)
+        or run_pull.get("number") != pull_number
+        or not isinstance(run_head, dict)
+        or run_head.get("ref") != head_ref
+        or run_head.get("sha") != head_sha
+        or not isinstance(run_head.get("repo"), dict)
+        or run_head["repo"].get("id") != repository_id
+        or not isinstance(run_base, dict)
+        or run_base.get("ref") != "main"
+        or run_base.get("sha") != base_sha
+        or not isinstance(run_base.get("repo"), dict)
+        or run_base["repo"].get("id") != repository_id
+    ):
+        raise ContractError(f"exact {label} pull-request tuple is not exact")
+    if (
+        selected.get("status") != "completed"
+        or selected.get("conclusion") != "success"
+    ):
+        raise ContractError(f"latest exact {label} did not succeed")
     return {
+        "base_revision": base_sha,
         "conclusion": "success",
         "event": "pull_request",
+        "head_ref": head_ref,
         "head_revision": head_sha,
-        "name": REQUIRED_WORKFLOW_NAME,
-        "path": REQUIRED_WORKFLOW_PATH,
+        "name": workflow_name,
+        "path": workflow_path,
+        "pull_request_number": pull_number,
+        "repository_id": repository_id,
         "run_attempt": selected.get("run_attempt"),
         "run_id": selected.get("id"),
         "status": "completed",
-        "workflow_id": expected_id,
+        "workflow_id": workflow_id,
     }
+
+
+def _require_release_workflow(
+    rows: object,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+) -> dict[str, object]:
+    return _require_exact_pull_request_workflow(
+        rows,
+        repository,
+        repository_id,
+        pull_number,
+        base_sha,
+        head_ref,
+        head_sha,
+        workflow_id=TARGET_RELEASE_WORKFLOW_IDS[repository],
+        workflow_name=RELEASE_WORKFLOW_NAME,
+        workflow_path=RELEASE_WORKFLOW_PATH,
+        label="publisher workflow",
+    )
+
+
+def _require_boundary_workflow(
+    rows: object,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+) -> dict[str, object]:
+    return _require_exact_pull_request_workflow(
+        rows,
+        repository,
+        repository_id,
+        pull_number,
+        base_sha,
+        head_ref,
+        head_sha,
+        workflow_id=TARGET_REQUIRED_WORKFLOW_IDS[repository],
+        workflow_name=REQUIRED_WORKFLOW_NAME,
+        workflow_path=REQUIRED_WORKFLOW_PATH,
+        label="required release-boundary workflow",
+    )
 
 
 def require_governed_main(
@@ -576,6 +720,7 @@ def require_governed_main(
         base = pull.get("base")
         merged_by = pull.get("merged_by")
         head_sha = exact_sha((head or {}).get("sha"), "pull-request head revision")
+        head_ref = (head or {}).get("ref")
         if (
             pull.get("state") != "closed"
             or not pull.get("merged")
@@ -587,8 +732,12 @@ def require_governed_main(
             or not isinstance(base.get("repo"), dict)
             or base["repo"].get("full_name") != repository
             or not isinstance(head, dict)
+            or not isinstance(head_ref, str)
+            or not head_ref
             or not isinstance(head.get("repo"), dict)
             or head["repo"].get("full_name") != repository
+            or head["repo"].get("id") != expected_repository_id
+            or base["repo"].get("id") != expected_repository_id
             or not isinstance(merged_by, dict)
             or not isinstance(merged_by.get("login"), str)
         ):
@@ -599,14 +748,33 @@ def require_governed_main(
         workflow_runs = _request_json(
             f"{api_root}/repos/{repository}/actions/runs?{query}", token
         )
-        boundary = _require_boundary_workflow(workflow_runs, repository, head_sha)
+        release_workflow = _require_release_workflow(
+            workflow_runs,
+            repository,
+            expected_repository_id,
+            number,
+            before_sha,
+            head_ref,
+            head_sha,
+        )
+        boundary = _require_boundary_workflow(
+            workflow_runs,
+            repository,
+            expected_repository_id,
+            number,
+            before_sha,
+            head_ref,
+            head_sha,
+        )
         check_runs = _request_json(
             f"{api_root}/repos/{repository}/commits/{head_sha}/check-runs?per_page=100",
             token,
         )
-        checks = _require_successful_checks(check_runs, head_sha)
+        checks = _require_successful_checks(
+            check_runs, repository, head_sha, int(release_workflow["run_id"])
+        )
         evidence = {
-            "schema": "szl.github-governed-merge/v1",
+            "schema": "szl.github-governed-merge/v2",
             "status": "AUTHORIZED_EXACT_GOVERNED_MERGE",
             "source_revision": source_sha,
             "repository": {
@@ -617,6 +785,7 @@ def require_governed_main(
             "push": {"before": before_sha, "after": source_sha},
             "pull_request": {
                 "base_revision": before_sha,
+                "head_ref": head_ref,
                 "head_revision": head_sha,
                 "merge_revision": source_sha,
                 "merged_at": pull["merged_at"],
@@ -624,6 +793,7 @@ def require_governed_main(
                 "number": number,
             },
             "required_checks": checks,
+            "release_workflow": release_workflow,
             "required_workflow": boundary,
         }
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -648,6 +818,54 @@ def require_governed_main(
         raise
 
 
+def _workflow_evidence_is_exact(
+    workflow: object,
+    *,
+    workflow_id: int,
+    workflow_name: str,
+    workflow_path: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+) -> bool:
+    return (
+        isinstance(workflow, dict)
+        and set(workflow)
+        == {
+            "base_revision",
+            "conclusion",
+            "event",
+            "head_ref",
+            "head_revision",
+            "name",
+            "path",
+            "pull_request_number",
+            "repository_id",
+            "run_attempt",
+            "run_id",
+            "status",
+            "workflow_id",
+        }
+        and workflow.get("workflow_id") == workflow_id
+        and workflow.get("name") == workflow_name
+        and workflow.get("path") == workflow_path
+        and workflow.get("event") == "pull_request"
+        and workflow.get("repository_id") == repository_id
+        and workflow.get("pull_request_number") == pull_number
+        and workflow.get("base_revision") == base_sha
+        and workflow.get("head_ref") == head_ref
+        and workflow.get("head_revision") == head_sha
+        and workflow.get("status") == "completed"
+        and workflow.get("conclusion") == "success"
+        and type(workflow.get("run_id")) is int
+        and workflow["run_id"] > 0
+        and type(workflow.get("run_attempt")) is int
+        and workflow["run_attempt"] > 0
+    )
+
+
 def load_governed_merge(
     path: Path, source_sha: str, config_path: Path = DEFAULT_CONFIG
 ) -> dict:
@@ -664,12 +882,26 @@ def load_governed_merge(
     push = evidence.get("push")
     pull = evidence.get("pull_request")
     checks = evidence.get("required_checks")
+    release_workflow = evidence.get("release_workflow")
     workflow = evidence.get("required_workflow")
     expected_repository = config["source_repository"]
     expected_checks = {
         (name, integration_id)
         for name, integration_id in REQUIRED_STATUS_CONTEXTS.items()
     }
+    checks_are_exact = isinstance(checks, list) and all(
+        isinstance(row, dict)
+        and set(row)
+        == {
+            "app_id",
+            "check_run_id",
+            "conclusion",
+            "head_revision",
+            "name",
+            "workflow_run_id",
+        }
+        for row in checks
+    )
     observed_checks = {
         (row.get("name"), row.get("app_id"))
         for row in checks
@@ -678,7 +910,13 @@ def load_governed_merge(
         and row.get("conclusion") == "success"
         and type(row.get("check_run_id")) is int
         and row.get("check_run_id") > 0
+        and row.get("workflow_run_id") == (release_workflow or {}).get("run_id")
     } if isinstance(checks, list) else set()
+    pull_number = (pull or {}).get("number")
+    pull_base = (pull or {}).get("base_revision")
+    pull_head_ref = (pull or {}).get("head_ref")
+    pull_head = (pull or {}).get("head_revision")
+    repository_id = (repository or {}).get("id")
     if (
         set(evidence) != {
             "schema",
@@ -688,9 +926,10 @@ def load_governed_merge(
             "push",
             "pull_request",
             "required_checks",
+            "release_workflow",
             "required_workflow",
         }
-        or evidence.get("schema") != "szl.github-governed-merge/v1"
+        or evidence.get("schema") != "szl.github-governed-merge/v2"
         or evidence.get("status") != "AUTHORIZED_EXACT_GOVERNED_MERGE"
         or evidence.get("source_revision") != source_sha
         or not isinstance(repository, dict)
@@ -706,6 +945,7 @@ def load_governed_merge(
         or not isinstance(pull, dict)
         or set(pull) != {
             "base_revision",
+            "head_ref",
             "head_revision",
             "merge_revision",
             "merged_at",
@@ -713,6 +953,8 @@ def load_governed_merge(
             "number",
         }
         or pull.get("base_revision") != push.get("before")
+        or not isinstance(pull.get("head_ref"), str)
+        or not pull["head_ref"]
         or not isinstance(pull.get("head_revision"), str)
         or not HEX40.fullmatch(pull["head_revision"])
         or pull.get("merge_revision") != source_sha
@@ -724,31 +966,30 @@ def load_governed_merge(
         or pull["number"] <= 0
         or not isinstance(checks, list)
         or len(checks) != len(expected_checks)
+        or not checks_are_exact
         or observed_checks != expected_checks
-        or not isinstance(workflow, dict)
-        or set(workflow) != {
-            "conclusion",
-            "event",
-            "head_revision",
-            "name",
-            "path",
-            "run_attempt",
-            "run_id",
-            "status",
-            "workflow_id",
-        }
-        or workflow.get("workflow_id")
-        != TARGET_REQUIRED_WORKFLOW_IDS[expected_repository]
-        or workflow.get("name") != REQUIRED_WORKFLOW_NAME
-        or workflow.get("path") != REQUIRED_WORKFLOW_PATH
-        or workflow.get("event") != "pull_request"
-        or workflow.get("head_revision") != pull.get("head_revision")
-        or workflow.get("status") != "completed"
-        or workflow.get("conclusion") != "success"
-        or type(workflow.get("run_id")) is not int
-        or workflow["run_id"] <= 0
-        or type(workflow.get("run_attempt")) is not int
-        or workflow["run_attempt"] <= 0
+        or not _workflow_evidence_is_exact(
+            release_workflow,
+            workflow_id=TARGET_RELEASE_WORKFLOW_IDS[expected_repository],
+            workflow_name=RELEASE_WORKFLOW_NAME,
+            workflow_path=RELEASE_WORKFLOW_PATH,
+            repository_id=repository_id,
+            pull_number=pull_number,
+            base_sha=pull_base,
+            head_ref=pull_head_ref,
+            head_sha=pull_head,
+        )
+        or not _workflow_evidence_is_exact(
+            workflow,
+            workflow_id=TARGET_REQUIRED_WORKFLOW_IDS[expected_repository],
+            workflow_name=REQUIRED_WORKFLOW_NAME,
+            workflow_path=REQUIRED_WORKFLOW_PATH,
+            repository_id=repository_id,
+            pull_number=pull_number,
+            base_sha=pull_base,
+            head_ref=pull_head_ref,
+            head_sha=pull_head,
+        )
     ):
         raise ContractError("governed-merge evidence is not bound to this release")
     return evidence

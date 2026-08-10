@@ -26,12 +26,14 @@ SOURCE_SHA = "a" * 40
 PARENT_SHA = "b" * 40
 TARGET_SHA = "c" * 40
 PR_HEAD_SHA = "d" * 40
+RELEASE_RUN_ID = 98
+BOUNDARY_RUN_ID = 99
 
 
 def governed_merge_evidence(source_sha: str = SOURCE_SHA) -> dict:
     repository = MODULE.load_config()["source_repository"]
     return {
-        "schema": "szl.github-governed-merge/v1",
+        "schema": "szl.github-governed-merge/v2",
         "status": "AUTHORIZED_EXACT_GOVERNED_MERGE",
         "source_revision": source_sha,
         "repository": {
@@ -42,6 +44,7 @@ def governed_merge_evidence(source_sha: str = SOURCE_SHA) -> dict:
         "push": {"before": PARENT_SHA, "after": source_sha},
         "pull_request": {
             "base_revision": PARENT_SHA,
+            "head_ref": "release-candidate",
             "head_revision": PR_HEAD_SHA,
             "merge_revision": source_sha,
             "merged_at": "2026-08-10T00:00:00Z",
@@ -55,17 +58,37 @@ def governed_merge_evidence(source_sha: str = SOURCE_SHA) -> dict:
                 "conclusion": "success",
                 "head_revision": PR_HEAD_SHA,
                 "name": name,
+                "workflow_run_id": RELEASE_RUN_ID,
             }
             for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS))
         ],
-        "required_workflow": {
+        "release_workflow": {
+            "base_revision": PARENT_SHA,
             "conclusion": "success",
             "event": "pull_request",
+            "head_ref": "release-candidate",
+            "head_revision": PR_HEAD_SHA,
+            "name": MODULE.RELEASE_WORKFLOW_NAME,
+            "path": MODULE.RELEASE_WORKFLOW_PATH,
+            "pull_request_number": 7,
+            "repository_id": MODULE.TARGET_REPOSITORY_IDS[repository],
+            "run_attempt": 1,
+            "run_id": RELEASE_RUN_ID,
+            "status": "completed",
+            "workflow_id": MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+        },
+        "required_workflow": {
+            "base_revision": PARENT_SHA,
+            "conclusion": "success",
+            "event": "pull_request",
+            "head_ref": "release-candidate",
             "head_revision": PR_HEAD_SHA,
             "name": MODULE.REQUIRED_WORKFLOW_NAME,
             "path": MODULE.REQUIRED_WORKFLOW_PATH,
+            "pull_request_number": 7,
+            "repository_id": MODULE.TARGET_REPOSITORY_IDS[repository],
             "run_attempt": 1,
-            "run_id": 99,
+            "run_id": BOUNDARY_RUN_ID,
             "status": "completed",
             "workflow_id": MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
         },
@@ -98,7 +121,15 @@ def write_push_event(path: Path, source_sha: str = SOURCE_SHA) -> None:
     )
 
 
-def guard_responder(*, boundary_conclusion: str = "success", check_app_id: int = 15368):
+def guard_responder(
+    *,
+    boundary_conclusion: str = "success",
+    check_app_id: int = 15368,
+    release_conclusion: str = "success",
+    stale_boundary_success: bool = False,
+    stale_check_success: bool = False,
+    misbound_boundary: bool = False,
+):
     repository = MODULE.load_config()["source_repository"]
     repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
     pull = {
@@ -112,13 +143,52 @@ def guard_responder(*, boundary_conclusion: str = "success", check_app_id: int =
         "base": {
             "ref": "main",
             "sha": PARENT_SHA,
-            "repo": {"full_name": repository},
+            "repo": {"full_name": repository, "id": repository_id},
         },
         "head": {
+            "ref": "release-candidate",
             "sha": PR_HEAD_SHA,
-            "repo": {"full_name": repository},
+            "repo": {"full_name": repository, "id": repository_id},
         },
     }
+
+    def run_pull(number: int = 7) -> dict:
+        return {
+            "number": number,
+            "head": {
+                "ref": "release-candidate",
+                "sha": PR_HEAD_SHA,
+                "repo": {"id": repository_id},
+            },
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"id": repository_id},
+            },
+        }
+
+    def workflow_run(
+        run_id: int,
+        workflow_id: int,
+        name: str,
+        path: str,
+        conclusion: str,
+        *,
+        pull_number: int = 7,
+    ) -> dict:
+        return {
+            "id": run_id,
+            "workflow_id": workflow_id,
+            "name": name,
+            "path": path,
+            "event": "pull_request",
+            "head_sha": PR_HEAD_SHA,
+            "status": "completed",
+            "conclusion": conclusion,
+            "run_attempt": 1,
+            "repository": {"full_name": repository, "id": repository_id},
+            "pull_requests": [run_pull(pull_number)],
+        }
 
     def respond(url: str, token: str = "") -> object:
         if token != "github-test-token":
@@ -141,38 +211,76 @@ def guard_responder(*, boundary_conclusion: str = "success", check_app_id: int =
                 "pull_request"
             ]:
                 raise AssertionError("workflow query is not exact")
-            return {
-                "workflow_runs": [
-                    {
-                        "id": 99,
-                        "workflow_id": MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
-                        "name": MODULE.REQUIRED_WORKFLOW_NAME,
-                        "path": MODULE.REQUIRED_WORKFLOW_PATH,
-                        "event": "pull_request",
-                        "head_sha": PR_HEAD_SHA,
-                        "status": "completed",
-                        "conclusion": boundary_conclusion,
-                        "run_attempt": 1,
-                        "repository": {"full_name": repository},
-                    }
-                ]
-            }
+            runs = [
+                workflow_run(
+                    RELEASE_RUN_ID,
+                    MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+                    MODULE.RELEASE_WORKFLOW_NAME,
+                    MODULE.RELEASE_WORKFLOW_PATH,
+                    release_conclusion,
+                )
+            ]
+            if stale_boundary_success:
+                runs.append(
+                    workflow_run(
+                        BOUNDARY_RUN_ID,
+                        MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
+                        MODULE.REQUIRED_WORKFLOW_NAME,
+                        MODULE.REQUIRED_WORKFLOW_PATH,
+                        "success",
+                    )
+                )
+                boundary_run_id = BOUNDARY_RUN_ID + 100
+            else:
+                boundary_run_id = BOUNDARY_RUN_ID
+            runs.append(
+                workflow_run(
+                    boundary_run_id,
+                    MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
+                    MODULE.REQUIRED_WORKFLOW_NAME,
+                    MODULE.REQUIRED_WORKFLOW_PATH,
+                    boundary_conclusion,
+                    pull_number=8 if misbound_boundary else 7,
+                )
+            )
+            return {"total_count": len(runs), "workflow_runs": runs}
         if url.endswith(
             f"/repos/{repository}/commits/{PR_HEAD_SHA}/check-runs?per_page=100"
         ):
-            return {
-                "check_runs": [
+            checks = []
+            for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS)):
+                check_id = index + 10
+                checks.append(
                     {
-                        "id": index + 10,
+                        "id": check_id,
                         "name": name,
                         "head_sha": PR_HEAD_SHA,
                         "status": "completed",
                         "conclusion": "success",
                         "app": {"id": check_app_id},
+                        "details_url": (
+                            f"https://github.com/{repository}/actions/runs/"
+                            f"{RELEASE_RUN_ID}/job/{check_id}"
+                        ),
                     }
-                    for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS))
-                ]
-            }
+                )
+                if stale_check_success:
+                    latest_id = check_id + 100
+                    checks.append(
+                        {
+                            "id": latest_id,
+                            "name": name,
+                            "head_sha": PR_HEAD_SHA,
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "app": {"id": check_app_id},
+                            "details_url": (
+                                f"https://github.com/{repository}/actions/runs/"
+                                f"{RELEASE_RUN_ID}/job/{latest_id}"
+                            ),
+                        }
+                    )
+            return {"total_count": len(checks), "check_runs": checks}
         raise AssertionError(f"unexpected guard URL: {url}")
 
     return respond
@@ -290,6 +398,21 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertEqual(packages["huggingface-hub"], "1.19.0")
         self.assertGreaterEqual(len(packages), 20)
 
+    def test_validator_lock_is_minimal_cross_platform_and_hash_closed(self) -> None:
+        lock = (ROOT / "requirements" / "hf-validator.lock").read_text(
+            encoding="utf-8"
+        )
+        requirements = re.findall(r"(?m)^([A-Za-z0-9_.-]+)==([^\s\\]+)", lock)
+        hashes = set(re.findall(r"--hash=sha256:([0-9a-f]{64})", lock))
+        self.assertEqual(requirements, [("PyYAML", "6.0.3")])
+        self.assertEqual(
+            hashes,
+            {
+                "ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc",
+                "5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b",
+            },
+        )
+
     def test_repository_identity_is_one_exact_governed_target(self) -> None:
         config = MODULE.load_config()
         expected = {
@@ -337,6 +460,10 @@ class StaticSpaceContractTests(unittest.TestCase):
                 result["required_workflow"]["workflow_id"],
                 MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
             )
+            self.assertEqual(
+                result["release_workflow"]["workflow_id"],
+                MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+            )
             self.assertEqual(output_path.read_bytes(), MODULE.canonical_json(result))
             self.assertFalse(failure_path.exists())
 
@@ -356,12 +483,34 @@ class StaticSpaceContractTests(unittest.TestCase):
                 (
                     "failed boundary",
                     guard_responder(boundary_conclusion="failure"),
-                    "required release-boundary workflow",
+                    "latest exact required release-boundary workflow",
+                ),
+                (
+                    "stale boundary success",
+                    guard_responder(
+                        boundary_conclusion="failure", stale_boundary_success=True
+                    ),
+                    "latest exact required release-boundary workflow",
+                ),
+                (
+                    "stale check success",
+                    guard_responder(stale_check_success=True),
+                    "latest exact publisher-workflow check",
+                ),
+                (
+                    "misbound boundary",
+                    guard_responder(misbound_boundary=True),
+                    "pull-request tuple is not exact",
+                ),
+                (
+                    "failed publisher workflow",
+                    guard_responder(release_conclusion="failure"),
+                    "latest exact publisher workflow",
                 ),
                 (
                     "wrong check app",
                     guard_responder(check_app_id=99),
-                    "required exact-head check",
+                    "required exact publisher-workflow check",
                 ),
             ]
             with mock.patch.dict(os.environ, environment, clear=False):
@@ -500,6 +649,7 @@ class StaticSpaceContractTests(unittest.TestCase):
         workflow = workflow_path.read_text(encoding="utf-8")
         document = yaml.safe_load(workflow)
         jobs = document["jobs"]
+        validate_text = json.dumps(jobs["validate"], sort_keys=True)
         self.assertEqual(jobs["dco"]["name"], "DCO")
         self.assertEqual(jobs["validate"]["name"], "validate-static-space")
         self.assertEqual(jobs["authorize"]["needs"], ["validate", "dco"])
@@ -526,6 +676,9 @@ class StaticSpaceContractTests(unittest.TestCase):
         measure_text = json.dumps(jobs["measure"], sort_keys=True)
         attest_text = json.dumps(jobs["attest"], sort_keys=True)
         self.assertNotIn("HF_TOKEN", authorize_text)
+        self.assertIn("requirements/hf-validator.lock", validate_text)
+        self.assertNotIn("requirements/hf-publisher.lock", validate_text)
+        self.assertNotIn("huggingface_hub", validate_text)
         self.assertNotIn("${{ github.token }}", deploy_text)
         self.assertIn('"GITHUB_TOKEN": ""', deploy_text)
         self.assertIn('"HF_TOKEN": "${{ secrets.HF_TOKEN }}"', deploy_text)

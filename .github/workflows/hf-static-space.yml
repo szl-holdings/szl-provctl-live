@@ -46,9 +46,9 @@ jobs:
           test "$($VALIDATOR_PYTHON -I -c 'import platform; print(platform.python_version())')" = "3.12.13"
           "$VALIDATOR_PYTHON" -I -m pip install --disable-pip-version-check \
             --require-hashes --only-binary=:all: --ignore-installed \
-            -r requirements/hf-publisher.lock
+            -r requirements/hf-validator.lock
           "$VALIDATOR_PYTHON" -I -c \
-            'import importlib.metadata as m, huggingface_hub as h; assert m.version("huggingface-hub") == "1.19.0" == h.__version__'
+            'import importlib.metadata as m, yaml; assert m.version("PyYAML") == "6.0.3" == yaml.__version__'
           "$VALIDATOR_PYTHON" -I -m unittest discover -s tests -v
           "$VALIDATOR_PYTHON" -I scripts/hf_static_space.py build \
             --source-sha "$SOURCE_SHA" \
