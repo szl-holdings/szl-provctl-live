@@ -207,7 +207,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hf-static-space-publisher-input-${{ github.sha }}
+          name: hf-static-space-publisher-input-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publisher-input
           include-hidden-files: true
           if-no-files-found: error
@@ -218,7 +218,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hf-static-space-authorization-${{ github.sha }}
+          name: hf-static-space-authorization-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/governed-merge.json
             ${{ runner.temp }}/governed-merge-failure.json
@@ -249,6 +249,7 @@ jobs:
       publisher-input-outcome: ${{ steps.publisher-input.outcome }}
       publisher-rebind-outcome: ${{ steps.publisher-rebind.outcome }}
       publisher-environment-outcome: ${{ steps.publisher-environment.outcome }}
+      publisher-freshness-outcome: ${{ steps.publisher-freshness.outcome }}
       publish-outcome: ${{ steps.publish.outcome }}
       publisher-evidence-outcome: ${{ steps.publisher-evidence.outcome }}
     steps:
@@ -261,7 +262,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: hf-static-space-publisher-input-${{ github.sha }}
+          name: hf-static-space-publisher-input-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publisher-input
       - name: Rebind five publisher inputs before interpretation or credentials
         id: publisher-rebind
@@ -318,6 +319,7 @@ jobs:
           "$PUBLISHER_PYTHON" -I -c \
             'import importlib.metadata as m, huggingface_hub as h; assert m.version("huggingface-hub") == "1.19.0" == h.__version__'
           echo "PUBLISHER_PYTHON=$PUBLISHER_PYTHON" >> "$GITHUB_ENV"
+          echo "PUBLISHER_VENV=$PUBLISHER_VENV" >> "$GITHUB_ENV"
       - name: Classify publisher-environment failure before credential materialization
         if: always() && steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome != 'success'
         run: |
@@ -326,9 +328,40 @@ jobs:
             --source-sha "$SOURCE_SHA" \
             --stage publisher_environment \
             --output "$RUNNER_TEMP/publication-evidence/hf-workflow-stage-failure.json"
+      - name: Reconfirm public main at exact source revision without credentials
+        id: publisher-freshness
+        if: steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+          HF_TOKEN: ""
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/public-main-home" "$RUNNER_TEMP/public-main-cache" "$RUNNER_TEMP/publication-evidence"
+          chmod 0700 "$RUNNER_TEMP/public-main-home" "$RUNNER_TEMP/public-main-cache"
+          /usr/bin/env -i \
+            HOME="$RUNNER_TEMP/public-main-home" \
+            HF_HOME="$RUNNER_TEMP/public-main-cache" \
+            XDG_CACHE_HOME="$RUNNER_TEMP/public-main-cache" \
+            PATH="$PUBLISHER_VENV/bin:/usr/bin:/bin" \
+            LANG="C.UTF-8" \
+            LC_ALL="C.UTF-8" \
+            PYTHONIOENCODING="utf-8" \
+            "$PUBLISHER_PYTHON" -I "$RUNNER_TEMP/publisher-input/scripts/hf_static_space.py" fresh-main \
+            --source-sha "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/publication-evidence/github-main-freshness.json"
+      - name: Classify public-main freshness failure before mutation
+        if: always() && steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome == 'success' && steps.publisher-freshness.outcome != 'success'
+        run: |
+          set -euo pipefail
+          "$PUBLISHER_PYTHON" -I "$RUNNER_TEMP/publisher-input/scripts/hf_static_space.py" stage-failure \
+            --source-sha "$SOURCE_SHA" \
+            --stage publisher_freshness \
+            --output "$RUNNER_TEMP/publication-evidence/hf-workflow-stage-failure.json"
       - name: Publish exact bundle with only the Hugging Face credential
         id: publish
-        if: steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome == 'success'
+        if: steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome == 'success' && steps.publisher-freshness.outcome == 'success'
         continue-on-error: true
         env:
           GITHUB_TOKEN: ""
@@ -359,7 +392,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hf-static-space-publication-${{ github.sha }}
+          name: hf-static-space-publication-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publication-evidence
           if-no-files-found: error
           retention-days: 90
@@ -370,12 +403,13 @@ jobs:
           test "${{ steps.publisher-input.outcome }}" = "success"
           test "${{ steps.publisher-rebind.outcome }}" = "success"
           test "${{ steps.publisher-environment.outcome }}" = "success"
+          test "${{ steps.publisher-freshness.outcome }}" = "success"
           test "${{ steps.publish.outcome }}" = "success"
           test "${{ steps.publisher-evidence.outcome }}" = "success"
 
   measure:
     name: measure-exact-publication
-    if: always() && needs.authorize.result == 'success' && needs.deploy.outputs.publish-outcome == 'success' && needs.deploy.outputs.publisher-evidence-outcome == 'success'
+    if: always() && needs.authorize.result == 'success' && needs.deploy.outputs.publisher-freshness-outcome == 'success' && needs.deploy.outputs.publish-outcome == 'success' && needs.deploy.outputs.publisher-evidence-outcome == 'success'
     needs: [authorize, deploy]
     permissions:
       actions: read
@@ -405,7 +439,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: hf-static-space-publisher-input-${{ github.sha }}
+          name: hf-static-space-publisher-input-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publisher-input
       - name: Rebind five measurement inputs before interpretation or credentials
         id: measurement-rebind
@@ -445,7 +479,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: hf-static-space-publication-${{ github.sha }}
+          name: hf-static-space-publication-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publication-evidence
       - name: Set up exact Python
         id: measurement-environment
@@ -480,7 +514,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hf-static-space-measurement-${{ github.sha }}
+          name: hf-static-space-measurement-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/measurement-evidence
           if-no-files-found: error
           retention-days: 90
@@ -548,7 +582,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
           ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
-          name: hf-static-space-publication-${{ github.sha }}
+          name: hf-static-space-publication-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publication-evidence
       - name: Download exact public measurement
         id: measurement-evidence-download
@@ -558,7 +592,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
           ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
-          name: hf-static-space-measurement-${{ github.sha }}
+          name: hf-static-space-measurement-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/measurement-evidence
       - name: Attest canonical exact-revision measurement with GitHub OIDC
         id: oidc
@@ -602,6 +636,7 @@ jobs:
               --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
               --publisher-rebind-outcome "${{ needs.deploy.outputs.publisher-rebind-outcome }}" \
               --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
+              --publisher-freshness-outcome "${{ needs.deploy.outputs.publisher-freshness-outcome }}" \
               --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
               --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
               --publisher-evidence-download-outcome "${{ steps.publisher-evidence-download.outcome }}" \
@@ -648,7 +683,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
           ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
-          name: hf-static-space-terminal-evidence-${{ github.sha }}
+          name: hf-static-space-terminal-evidence-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/publication-evidence
             ${{ runner.temp }}/measurement-evidence
@@ -678,6 +713,7 @@ jobs:
             --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
             --publisher-rebind-outcome "${{ needs.deploy.outputs.publisher-rebind-outcome }}" \
             --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
+            --publisher-freshness-outcome "${{ needs.deploy.outputs.publisher-freshness-outcome }}" \
             --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
             --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
             --publisher-evidence-download-outcome "${{ steps.publisher-evidence-download.outcome }}" \
@@ -702,7 +738,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
           ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
-          name: hf-static-space-terminal-upload-failure-${{ github.sha }}
+          name: hf-static-space-terminal-upload-failure-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/terminal-evidence/hf-workflow-stage-failure.json
           if-no-files-found: error
           retention-days: 90
@@ -718,6 +754,7 @@ jobs:
           test "${{ needs.deploy.outputs.publisher-input-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-rebind-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-environment-outcome }}" = "success"
+          test "${{ needs.deploy.outputs.publisher-freshness-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publish-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-evidence-outcome }}" = "success"
           test "${{ steps.publisher-evidence-download.outcome }}" = "success"

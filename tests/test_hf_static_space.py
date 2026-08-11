@@ -994,6 +994,57 @@ class StaticSpaceContractTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ContractError, "JSON request failed closed"):
                 MODULE._request_json("https://api.github.test/repos/example/repo", "token")
 
+    def test_public_main_freshness_is_anonymous_exact_and_canonical(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        ref_url = f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/ref/heads/main"
+        commit_url = (
+            f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{SOURCE_SHA}"
+        )
+        responses = [
+            {
+                "ref": "refs/heads/main",
+                "object": {"type": "commit", "sha": SOURCE_SHA, "url": commit_url},
+            },
+            {"sha": SOURCE_SHA, "url": commit_url},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "github-main-freshness.json"
+            with mock.patch.object(
+                MODULE, "_request_json", side_effect=responses
+            ) as request_json:
+                evidence = MODULE.require_public_main_fresh(SOURCE_SHA, output)
+            self.assertEqual(
+                request_json.call_args_list,
+                [mock.call(ref_url), mock.call(commit_url)],
+            )
+            self.assertEqual(evidence["schema"], "szl.github-public-main-freshness/v1")
+            self.assertEqual(evidence["status"], "PUBLIC_MAIN_FRESH")
+            self.assertEqual(evidence["credential_mode"], "anonymous_public_api")
+            self.assertEqual(evidence["source_revision"], SOURCE_SHA)
+            self.assertEqual(output.read_bytes(), MODULE.canonical_json(evidence))
+
+    def test_public_main_freshness_rejects_stale_or_malformed_responses(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        commit_url = (
+            f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{SOURCE_SHA}"
+        )
+        variants = (
+            [{"ref": "refs/heads/main", "object": {"type": "commit", "sha": TARGET_SHA, "url": commit_url}}],
+            [{"ref": "refs/heads/main", "object": {"type": "tag", "sha": SOURCE_SHA, "url": commit_url}}],
+            [
+                {"ref": "refs/heads/main", "object": {"type": "commit", "sha": SOURCE_SHA, "url": commit_url}},
+                {"sha": TARGET_SHA, "url": commit_url},
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, responses in enumerate(variants):
+                with self.subTest(index=index):
+                    with mock.patch.object(MODULE, "_request_json", side_effect=responses):
+                        with self.assertRaisesRegex(MODULE.ContractError, "public main"):
+                            MODULE.require_public_main_fresh(
+                                SOURCE_SHA, Path(temporary) / f"stale-{index}.json"
+                            )
+
     def test_guard_missing_token_fails_closed_before_api(self) -> None:
         repository = MODULE.load_config()["source_repository"]
         environment = {
@@ -1124,6 +1175,10 @@ class StaticSpaceContractTests(unittest.TestCase):
             jobs["authorize"]["outputs"]["authorization-evidence-outcome"],
             "${{ steps.authorization-evidence.outcome }}",
         )
+        self.assertEqual(
+            jobs["deploy"]["outputs"]["publisher-freshness-outcome"],
+            "${{ steps.publisher-freshness.outcome }}",
+        )
         self.assertIs(
             authorize_steps["publisher-input-evidence"]["with"]["include-hidden-files"],
             True,
@@ -1135,6 +1190,10 @@ class StaticSpaceContractTests(unittest.TestCase):
         )
         self.assertIn(
             'mkdir -p "$RUNNER_TEMP/publication-evidence"',
+            deploy_steps["publisher-environment"]["run"],
+        )
+        self.assertIn(
+            'echo "PUBLISHER_VENV=$PUBLISHER_VENV" >> "$GITHUB_ENV"',
             deploy_steps["publisher-environment"]["run"],
         )
         self.assertIn(
@@ -1185,6 +1244,7 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertIn("--authorization-outcome", workflow)
         self.assertIn("--authorization-evidence-outcome", workflow)
         self.assertIn("--publisher-environment-outcome", workflow)
+        self.assertIn("--publisher-freshness-outcome", workflow)
         self.assertIn("--publisher-rebind-outcome", workflow)
         self.assertIn("--publisher-evidence-outcome", workflow)
         self.assertIn("--publisher-evidence-download-outcome", workflow)
@@ -1206,6 +1266,7 @@ class StaticSpaceContractTests(unittest.TestCase):
         deploy_steps = jobs["deploy"]["steps"]
         positions = {step["name"]: index for index, step in enumerate(deploy_steps)}
         rebind_name = "Rebind five publisher inputs before interpretation or credentials"
+        freshness_name = "Reconfirm public main at exact source revision without credentials"
         self.assertLess(
             positions[rebind_name],
             positions["Install pinned Hugging Face client without repository credentials"],
@@ -1216,6 +1277,14 @@ class StaticSpaceContractTests(unittest.TestCase):
         )
         self.assertLess(
             positions[rebind_name],
+            positions["Publish exact bundle with only the Hugging Face credential"],
+        )
+        self.assertLess(
+            positions["Install pinned Hugging Face client without repository credentials"],
+            positions[freshness_name],
+        )
+        self.assertLess(
+            positions[freshness_name],
             positions["Publish exact bundle with only the Hugging Face credential"],
         )
         rebind_step = deploy_steps[positions[rebind_name]]
@@ -1229,12 +1298,36 @@ class StaticSpaceContractTests(unittest.TestCase):
             "Set up exact Python",
             "Install pinned Hugging Face client without repository credentials",
             "Classify publisher-environment failure before credential materialization",
+            freshness_name,
+            "Classify public-main freshness failure before mutation",
             "Publish exact bundle with only the Hugging Face credential",
         ):
             self.assertIn(
                 "publisher-rebind.outcome == 'success'",
                 deploy_steps[positions[step_name]].get("if", ""),
             )
+        freshness_step = deploy_steps[positions[freshness_name]]
+        self.assertEqual(
+            freshness_step["env"],
+            {"GITHUB_TOKEN": "", "GH_TOKEN": "", "HF_TOKEN": ""},
+        )
+        self.assertIn("fresh-main", freshness_step["run"])
+        self.assertIn("/usr/bin/env -i", freshness_step["run"])
+        freshness_isolated = freshness_step["run"].split("/usr/bin/env -i", 1)[1].split(
+            '"$PUBLISHER_PYTHON"', 1
+        )[0]
+        self.assertEqual(
+            set(re.findall(r"(?m)^\s*([A-Z][A-Z0-9_]*)=", freshness_isolated)),
+            {"HOME", "HF_HOME", "XDG_CACHE_HOME", "PATH", "LANG", "LC_ALL", "PYTHONIOENCODING"},
+        )
+        for forbidden in ("ACTIONS_", "GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN"):
+            self.assertNotIn(forbidden, freshness_isolated)
+        self.assertIn(
+            "publisher-freshness.outcome == 'success'",
+            deploy_steps[positions[
+                "Publish exact bundle with only the Hugging Face credential"
+            ]]["if"],
+        )
         publish_run = deploy_steps[positions[
             "Publish exact bundle with only the Hugging Face credential"
         ]]["run"]
@@ -1267,6 +1360,20 @@ class StaticSpaceContractTests(unittest.TestCase):
             "GH_TOKEN",
         ):
             self.assertNotIn(forbidden, isolated)
+
+        artifact_steps = [
+            step
+            for job in jobs.values()
+            for step in job.get("steps", [])
+            if str(step.get("uses", "")).startswith(
+                ("actions/upload-artifact@", "actions/download-artifact@")
+            )
+        ]
+        self.assertGreater(len(artifact_steps), 0)
+        for step in artifact_steps:
+            artifact_name = step["with"]["name"]
+            self.assertIn("${{ github.sha }}", artifact_name)
+            self.assertIn("${{ github.run_attempt }}", artifact_name)
 
         measurement_rebind = measure_steps["measurement-rebind"]
         self.assertEqual(
@@ -1893,6 +2000,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             ),
             ({"publisher_input_outcome": "failure"}, "publisher_input"),
             ({"publisher_environment_outcome": "failure"}, "publisher_environment"),
+            ({"publisher_freshness_outcome": "failure"}, "publisher_freshness"),
             ({"publisher_evidence_outcome": "failure"}, "publisher_evidence_upload"),
             (
                 {"publisher_evidence_download_outcome": "failure"},

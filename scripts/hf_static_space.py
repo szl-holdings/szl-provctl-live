@@ -59,6 +59,7 @@ DEPLOY_DEADLINE_SECONDS = 300.0
 MUTATION_READBACK_SECONDS = 90.0
 UA = "szl-hf-static-space/1.0"
 GITHUB_API_VERSION = "2026-03-10"
+PUBLIC_GITHUB_API_ROOT = "https://api.github.com"
 GITHUB_PER_PAGE = 100
 GITHUB_MAX_PAGES = 100
 GOVERNED_MERGE_SCHEMA = "szl.github-governed-merge/v3"
@@ -436,6 +437,51 @@ def _request_json(url: str, token: str = "") -> object:
         raise ContractError(
             f"JSON request failed closed for {url}: {type(error).__name__}"
         ) from error
+
+
+def require_public_main_fresh(
+    source_sha: str,
+    output_path: Path,
+    config_path: Path = DEFAULT_CONFIG,
+) -> dict:
+    """Rebind the exact source revision to public main without credentials."""
+    source_sha = exact_sha(source_sha)
+    config = load_config(config_path)
+    repository = str(config["source_repository"])
+    ref_url = f"{PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/ref/heads/main"
+    commit_url = (
+        f"{PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{source_sha}"
+    )
+    ref_document = _request_json(ref_url)
+    ref_object = ref_document.get("object") if isinstance(ref_document, dict) else None
+    if (
+        not isinstance(ref_document, dict)
+        or ref_document.get("ref") != "refs/heads/main"
+        or not isinstance(ref_object, dict)
+        or ref_object.get("type") != "commit"
+        or ref_object.get("sha") != source_sha
+        or ref_object.get("url") != commit_url
+    ):
+        raise ContractError("public main ref does not identify the exact source revision")
+    commit_document = _request_json(commit_url)
+    if (
+        not isinstance(commit_document, dict)
+        or commit_document.get("sha") != source_sha
+        or commit_document.get("url") != commit_url
+    ):
+        raise ContractError("public main commit response is not exact")
+    evidence = {
+        "schema": "szl.github-public-main-freshness/v1",
+        "status": "PUBLIC_MAIN_FRESH",
+        "source": _source_identity(config, source_sha),
+        "source_revision": source_sha,
+        "ref": "refs/heads/main",
+        "commit_api_url": commit_url,
+        "credential_mode": "anonymous_public_api",
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(canonical_json(evidence))
+    return evidence
 
 
 def _paged_url(url: str, page: int) -> str:
@@ -2099,6 +2145,7 @@ def write_workflow_stage_failure(
         "publisher_input",
         "publisher_executable_rebind",
         "publisher_environment",
+        "publisher_freshness",
         "publisher_mutation",
         "publisher_evidence_upload",
         "measurement_hardening",
@@ -2155,6 +2202,7 @@ def synthesize_workflow_outcome(
     publisher_input_outcome: str = "success",
     publisher_rebind_outcome: str = "success",
     publisher_environment_outcome: str = "success",
+    publisher_freshness_outcome: str = "success",
     publisher_evidence_outcome: str = "success",
     publisher_evidence_download_outcome: str = "success",
     measurement_hardening_outcome: str = "success",
@@ -2193,6 +2241,7 @@ def synthesize_workflow_outcome(
         "publisher_input": publisher_input_outcome,
         "publisher_executable_rebind": publisher_rebind_outcome,
         "publisher_environment": publisher_environment_outcome,
+        "publisher_freshness": publisher_freshness_outcome,
         "publisher_mutation": publish_outcome,
         "publisher_evidence_upload": publisher_evidence_outcome,
         "publisher_evidence_download": publisher_evidence_download_outcome,
@@ -2322,6 +2371,9 @@ def main() -> int:
     stage_failure.add_argument("--source-sha", required=True)
     stage_failure.add_argument("--stage", required=True)
     stage_failure.add_argument("--output", type=Path, required=True)
+    fresh_main = subparsers.add_parser("fresh-main")
+    fresh_main.add_argument("--source-sha", required=True)
+    fresh_main.add_argument("--output", type=Path, required=True)
     outcome = subparsers.add_parser("workflow-outcome")
     outcome.add_argument("--source-sha", required=True)
     outcome.add_argument("--result", type=Path, required=True)
@@ -2339,6 +2391,7 @@ def main() -> int:
     outcome.add_argument("--publisher-input-outcome", default="success")
     outcome.add_argument("--publisher-rebind-outcome", default="success")
     outcome.add_argument("--publisher-environment-outcome", default="success")
+    outcome.add_argument("--publisher-freshness-outcome", default="success")
     outcome.add_argument("--publisher-evidence-outcome", default="success")
     outcome.add_argument("--publisher-evidence-download-outcome", default="success")
     outcome.add_argument("--measurement-hardening-outcome", default="success")
@@ -2396,6 +2449,8 @@ def main() -> int:
         value = write_workflow_stage_failure(
             args.source_sha, args.stage, args.output, args.config
         )
+    elif args.command == "fresh-main":
+        value = require_public_main_fresh(args.source_sha, args.output, args.config)
     else:
         value = synthesize_workflow_outcome(
             args.source_sha,
@@ -2418,6 +2473,7 @@ def main() -> int:
             publisher_input_outcome=args.publisher_input_outcome,
             publisher_rebind_outcome=args.publisher_rebind_outcome,
             publisher_environment_outcome=args.publisher_environment_outcome,
+            publisher_freshness_outcome=args.publisher_freshness_outcome,
             publisher_evidence_outcome=args.publisher_evidence_outcome,
             publisher_evidence_download_outcome=args.publisher_evidence_download_outcome,
             measurement_hardening_outcome=args.measurement_hardening_outcome,
