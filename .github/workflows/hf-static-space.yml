@@ -336,7 +336,18 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
-          "$PUBLISHER_PYTHON" -I "$RUNNER_TEMP/publisher-input/scripts/hf_static_space.py" deploy \
+          mkdir -p "$RUNNER_TEMP/hf-publisher-home" "$RUNNER_TEMP/hf-publisher-cache"
+          chmod 0700 "$RUNNER_TEMP/hf-publisher-home" "$RUNNER_TEMP/hf-publisher-cache"
+          /usr/bin/env -i \
+            HOME="$RUNNER_TEMP/hf-publisher-home" \
+            HF_HOME="$RUNNER_TEMP/hf-publisher-cache" \
+            XDG_CACHE_HOME="$RUNNER_TEMP/hf-publisher-cache" \
+            PATH="$PUBLISHER_VENV/bin:/usr/bin:/bin" \
+            LANG="C.UTF-8" \
+            LC_ALL="C.UTF-8" \
+            PYTHONIOENCODING="utf-8" \
+            HF_TOKEN="$HF_TOKEN" \
+            "$PUBLISHER_PYTHON" -I "$RUNNER_TEMP/publisher-input/scripts/hf_static_space.py" deploy \
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/publisher-input/hf-static-space" \
             --authorization "$RUNNER_TEMP/publisher-input/governed-merge.json" \
@@ -364,8 +375,8 @@ jobs:
 
   measure:
     name: measure-exact-publication
-    if: always() && needs.deploy.outputs.publish-outcome == 'success' && needs.deploy.outputs.publisher-evidence-outcome == 'success'
-    needs: [deploy]
+    if: always() && needs.authorize.result == 'success' && needs.deploy.outputs.publish-outcome == 'success' && needs.deploy.outputs.publisher-evidence-outcome == 'success'
+    needs: [authorize, deploy]
     permissions:
       actions: read
       checks: read
@@ -374,29 +385,78 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
+      measurement-hardening-outcome: ${{ steps.measurement-hardening.outcome }}
+      measurement-input-outcome: ${{ steps.measurement-input.outcome }}
+      measurement-rebind-outcome: ${{ steps.measurement-rebind.outcome }}
+      measurement-publisher-evidence-outcome: ${{ steps.measurement-publisher-evidence.outcome }}
+      measurement-environment-outcome: ${{ steps.measurement-environment.outcome }}
       measurement-outcome: ${{ steps.measurement.outcome }}
       measurement-evidence-outcome: ${{ steps.measurement-evidence.outcome }}
     steps:
       - name: Harden runner
+        id: measurement-hardening
+        continue-on-error: true
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: audit
       - name: Download exact authorized publisher input
+        id: measurement-input
+        if: steps.measurement-hardening.outcome == 'success'
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: hf-static-space-publisher-input-${{ github.sha }}
           path: ${{ runner.temp }}/publisher-input
+      - name: Rebind five measurement inputs before interpretation or credentials
+        id: measurement-rebind
+        if: steps.measurement-input.outcome == 'success'
+        continue-on-error: true
+        env:
+          EXPECTED_PUBLISHER_SCRIPT_SHA256: ${{ needs.authorize.outputs.publisher_script_sha256 }}
+          EXPECTED_PUBLISHER_LOCK_SHA256: ${{ needs.authorize.outputs.publisher_lock_sha256 }}
+          EXPECTED_PUBLISHER_CONFIG_SHA256: ${{ needs.authorize.outputs.publisher_config_sha256 }}
+          EXPECTED_AUTHORIZATION_SHA256: ${{ needs.authorize.outputs.authorization_sha256 }}
+          EXPECTED_BUNDLE_MANIFEST_SHA256: ${{ needs.authorize.outputs.bundle_manifest_sha256 }}
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+          HF_TOKEN: ""
+        run: |
+          set -euo pipefail
+          INPUT="$RUNNER_TEMP/publisher-input"
+          require_digest() {
+            local expected="$1"
+            local path="$2"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            test -f "$path"
+            test ! -L "$path"
+            local actual
+            actual="$(sha256sum "$path")"
+            actual="${actual%% *}"
+            test "$actual" = "$expected"
+          }
+          require_digest "$EXPECTED_PUBLISHER_SCRIPT_SHA256" "$INPUT/scripts/hf_static_space.py"
+          require_digest "$EXPECTED_PUBLISHER_LOCK_SHA256" "$INPUT/requirements/hf-publisher.lock"
+          require_digest "$EXPECTED_PUBLISHER_CONFIG_SHA256" "$INPUT/.hf-space.json"
+          require_digest "$EXPECTED_AUTHORIZATION_SHA256" "$INPUT/governed-merge.json"
+          require_digest "$EXPECTED_BUNDLE_MANIFEST_SHA256" "$INPUT/hf-static-space/hf-deploy-manifest.json"
       - name: Download exact publisher outcome
+        id: measurement-publisher-evidence
+        if: steps.measurement-rebind.outcome == 'success'
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: hf-static-space-publication-${{ github.sha }}
           path: ${{ runner.temp }}/publication-evidence
       - name: Set up exact Python
+        id: measurement-environment
+        if: steps.measurement-publisher-evidence.outcome == 'success'
+        continue-on-error: true
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12.13"
       - name: Measure public bytes and reauthorize current main without HF credentials
         id: measurement
+        if: steps.measurement-environment.outcome == 'success'
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -404,6 +464,7 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/measurement-evidence"
           python -I "$RUNNER_TEMP/publisher-input/scripts/hf_static_space.py" attest \
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/publisher-input/hf-static-space" \
@@ -427,6 +488,11 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          test "${{ steps.measurement-hardening.outcome }}" = "success"
+          test "${{ steps.measurement-input.outcome }}" = "success"
+          test "${{ steps.measurement-rebind.outcome }}" = "success"
+          test "${{ steps.measurement-publisher-evidence.outcome }}" = "success"
+          test "${{ steps.measurement-environment.outcome }}" = "success"
           test "${{ steps.measurement.outcome }}" = "success"
           test "${{ steps.measurement-evidence.outcome }}" = "success"
 
@@ -444,23 +510,43 @@ jobs:
       SOURCE_SHA: ${{ github.sha }}
     steps:
       - name: Harden runner
+        id: attestation-hardening
+        continue-on-error: true
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
           egress-policy: audit
       - name: Checkout exact protected-main evidence synthesizer
+        id: attestation-checkout
+        if: steps.attestation-hardening.outcome == 'success'
+        continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
       - name: Set up exact Python
+        id: attestation-environment
+        if: steps.attestation-checkout.outcome == 'success'
+        continue-on-error: true
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
           python-version: "3.12.13"
       - name: Download exact publisher outcome
         id: publisher-evidence-download
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
           name: hf-static-space-publication-${{ github.sha }}
           path: ${{ runner.temp }}/publication-evidence
@@ -468,53 +554,99 @@ jobs:
         id: measurement-evidence-download
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
           name: hf-static-space-measurement-${{ github.sha }}
           path: ${{ runner.temp }}/measurement-evidence
       - name: Attest canonical exact-revision measurement with GitHub OIDC
         id: oidc
-        if: needs.measure.outputs.measurement-outcome == 'success' && needs.measure.outputs.measurement-evidence-outcome == 'success' && steps.publisher-evidence-download.outcome == 'success' && steps.measurement-evidence-download.outcome == 'success'
+        if: steps.attestation-hardening.outcome == 'success' && steps.attestation-checkout.outcome == 'success' && steps.attestation-environment.outcome == 'success' && needs.measure.outputs.measurement-hardening-outcome == 'success' && needs.measure.outputs.measurement-input-outcome == 'success' && needs.measure.outputs.measurement-rebind-outcome == 'success' && needs.measure.outputs.measurement-publisher-evidence-outcome == 'success' && needs.measure.outputs.measurement-environment-outcome == 'success' && needs.measure.outputs.measurement-outcome == 'success' && needs.measure.outputs.measurement-evidence-outcome == 'success' && steps.publisher-evidence-download.outcome == 'success' && steps.measurement-evidence-download.outcome == 'success'
         continue-on-error: true
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: ${{ runner.temp }}/measurement-evidence/hf-live-attestation.json
       - name: Synthesize final receipt or exact workflow-stage failure
+        id: workflow-outcome
         if: always()
+        continue-on-error: true
         env:
           ATTESTATION_ID: ${{ steps.oidc.outputs.attestation-id }}
           ATTESTATION_URL: ${{ steps.oidc.outputs.attestation-url }}
           GITHUB_TOKEN: ""
           GH_TOKEN: ""
           HF_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          ATTESTATION_HARDENING_OUTCOME: ${{ steps.attestation-hardening.outcome }}
+          ATTESTATION_CHECKOUT_OUTCOME: ${{ steps.attestation-checkout.outcome }}
+          ATTESTATION_ENVIRONMENT_OUTCOME: ${{ steps.attestation-environment.outcome }}
         run: |
           set -euo pipefail
-          python -I scripts/hf_static_space.py workflow-outcome \
-            --source-sha "$SOURCE_SHA" \
-            --result "$RUNNER_TEMP/publication-evidence/hf-deploy-result.json" \
-            --measurement "$RUNNER_TEMP/measurement-evidence/hf-live-attestation.json" \
-            --mutation-failure "$RUNNER_TEMP/publication-evidence/hf-publication-failure.json" \
-            --partial "$RUNNER_TEMP/measurement-evidence/hf-publication-partial.json" \
-            --receipt "$RUNNER_TEMP/terminal-evidence/hf-oidc-receipt.json" \
-            --workflow-failure "$RUNNER_TEMP/terminal-evidence/hf-workflow-stage-failure.json" \
-            --authorization-outcome "${{ needs.authorize.outputs.authorization-outcome }}" \
-            --authorization-evidence-outcome "${{ needs.authorize.outputs.authorization-evidence-outcome }}" \
-            --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
-            --publisher-rebind-outcome "${{ needs.deploy.outputs.publisher-rebind-outcome }}" \
-            --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
-            --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
-            --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
-            --publisher-evidence-download-outcome "${{ steps.publisher-evidence-download.outcome }}" \
-            --measurement-outcome "${{ needs.measure.outputs.measurement-outcome }}" \
-            --success-evidence-outcome "${{ needs.measure.outputs.measurement-evidence-outcome }}" \
-            --measurement-evidence-download-outcome "${{ steps.measurement-evidence-download.outcome }}" \
-            --oidc-outcome "${{ steps.oidc.outcome }}" \
-            --attestation-id "$ATTESTATION_ID" \
-            --attestation-url "$ATTESTATION_URL"
+          synthesis_status=1
+          if test "$ATTESTATION_HARDENING_OUTCOME" = "success" && \
+             test "$ATTESTATION_CHECKOUT_OUTCOME" = "success" && \
+             test "$ATTESTATION_ENVIRONMENT_OUTCOME" = "success"; then
+            set +e
+            python -I scripts/hf_static_space.py workflow-outcome \
+              --source-sha "$SOURCE_SHA" \
+              --result "$RUNNER_TEMP/publication-evidence/hf-deploy-result.json" \
+              --measurement "$RUNNER_TEMP/measurement-evidence/hf-live-attestation.json" \
+              --mutation-failure "$RUNNER_TEMP/publication-evidence/hf-publication-failure.json" \
+              --partial "$RUNNER_TEMP/measurement-evidence/hf-publication-partial.json" \
+              --receipt "$RUNNER_TEMP/terminal-evidence/hf-oidc-receipt.json" \
+              --workflow-failure "$RUNNER_TEMP/terminal-evidence/hf-workflow-stage-failure.json" \
+              --authorization-outcome "${{ needs.authorize.outputs.authorization-outcome }}" \
+              --authorization-evidence-outcome "${{ needs.authorize.outputs.authorization-evidence-outcome }}" \
+              --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
+              --publisher-rebind-outcome "${{ needs.deploy.outputs.publisher-rebind-outcome }}" \
+              --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
+              --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
+              --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
+              --publisher-evidence-download-outcome "${{ steps.publisher-evidence-download.outcome }}" \
+              --measurement-hardening-outcome "${{ needs.measure.outputs.measurement-hardening-outcome }}" \
+              --measurement-input-outcome "${{ needs.measure.outputs.measurement-input-outcome }}" \
+              --measurement-rebind-outcome "${{ needs.measure.outputs.measurement-rebind-outcome }}" \
+              --measurement-publisher-evidence-outcome "${{ needs.measure.outputs.measurement-publisher-evidence-outcome }}" \
+              --measurement-environment-outcome "${{ needs.measure.outputs.measurement-environment-outcome }}" \
+              --measurement-outcome "${{ needs.measure.outputs.measurement-outcome }}" \
+              --success-evidence-outcome "${{ needs.measure.outputs.measurement-evidence-outcome }}" \
+              --measurement-evidence-download-outcome "${{ steps.measurement-evidence-download.outcome }}" \
+              --attestation-hardening-outcome "$ATTESTATION_HARDENING_OUTCOME" \
+              --attestation-checkout-outcome "$ATTESTATION_CHECKOUT_OUTCOME" \
+              --attestation-environment-outcome "$ATTESTATION_ENVIRONMENT_OUTCOME" \
+              --oidc-outcome "${{ steps.oidc.outcome }}" \
+              --attestation-id "$ATTESTATION_ID" \
+              --attestation-url "$ATTESTATION_URL"
+            synthesis_status=$?
+            set -e
+          fi
+          if (( synthesis_status != 0 )); then
+            failure_stage="terminal_synthesizer_bootstrap"
+            if test "$ATTESTATION_HARDENING_OUTCOME" != "success"; then
+              failure_stage="attestation_hardening"
+            elif test "$ATTESTATION_CHECKOUT_OUTCOME" != "success"; then
+              failure_stage="attestation_checkout"
+            elif test "$ATTESTATION_ENVIRONMENT_OUTCOME" != "success"; then
+              failure_stage="attestation_environment"
+            fi
+            [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || SOURCE_SHA=""
+            mkdir -p "$RUNNER_TEMP/terminal-evidence"
+            fallback="$RUNNER_TEMP/terminal-evidence/hf-workflow-stage-failure.json"
+            printf '%s\n' "{\"deployment_success\":false,\"failure_stage\":\"${failure_stage}\",\"hf_revision\":null,\"receipt_minted\":false,\"schema\":\"szl.hf-workflow-stage-failure/v1\",\"source\":null,\"source_revision\":\"${SOURCE_SHA}\",\"status\":\"WORKFLOW_STAGE_FAILURE\",\"target\":null}" > "${fallback}.tmp"
+            mv "${fallback}.tmp" "$fallback"
+            rm -f "$RUNNER_TEMP/terminal-evidence/hf-oidc-receipt.json"
+          fi
+          exit "$synthesis_status"
       - name: Upload terminal governed evidence
         id: terminal-evidence
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
           name: hf-static-space-terminal-evidence-${{ github.sha }}
           path: |
@@ -529,6 +661,8 @@ jobs:
           GITHUB_TOKEN: ""
           GH_TOKEN: ""
           HF_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         run: |
           set -euo pipefail
           python -I scripts/hf_static_space.py workflow-outcome \
@@ -547,15 +681,26 @@ jobs:
             --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
             --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
             --publisher-evidence-download-outcome "${{ steps.publisher-evidence-download.outcome }}" \
+            --measurement-hardening-outcome "${{ needs.measure.outputs.measurement-hardening-outcome }}" \
+            --measurement-input-outcome "${{ needs.measure.outputs.measurement-input-outcome }}" \
+            --measurement-rebind-outcome "${{ needs.measure.outputs.measurement-rebind-outcome }}" \
+            --measurement-publisher-evidence-outcome "${{ needs.measure.outputs.measurement-publisher-evidence-outcome }}" \
+            --measurement-environment-outcome "${{ needs.measure.outputs.measurement-environment-outcome }}" \
             --measurement-outcome "${{ needs.measure.outputs.measurement-outcome }}" \
             --success-evidence-outcome "${{ needs.measure.outputs.measurement-evidence-outcome }}" \
             --measurement-evidence-download-outcome "${{ steps.measurement-evidence-download.outcome }}" \
+            --attestation-hardening-outcome "${{ steps.attestation-hardening.outcome }}" \
+            --attestation-checkout-outcome "${{ steps.attestation-checkout.outcome }}" \
+            --attestation-environment-outcome "${{ steps.attestation-environment.outcome }}" \
             --oidc-outcome "${{ steps.oidc.outcome }}" \
             --force-failure-stage terminal_evidence_upload
       - name: Upload terminal failure evidence
         if: always() && steps.terminal-evidence.outcome != 'success'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         with:
           name: hf-static-space-terminal-upload-failure-${{ github.sha }}
           path: ${{ runner.temp }}/terminal-evidence/hf-workflow-stage-failure.json
@@ -563,6 +708,9 @@ jobs:
           retention-days: 90
       - name: Require terminal governed success
         if: always()
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
         run: |
           set -euo pipefail
           test "${{ needs.authorize.outputs.authorization-outcome }}" = "success"
@@ -573,10 +721,19 @@ jobs:
           test "${{ needs.deploy.outputs.publish-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-evidence-outcome }}" = "success"
           test "${{ steps.publisher-evidence-download.outcome }}" = "success"
+          test "${{ needs.measure.outputs.measurement-hardening-outcome }}" = "success"
+          test "${{ needs.measure.outputs.measurement-input-outcome }}" = "success"
+          test "${{ needs.measure.outputs.measurement-rebind-outcome }}" = "success"
+          test "${{ needs.measure.outputs.measurement-publisher-evidence-outcome }}" = "success"
+          test "${{ needs.measure.outputs.measurement-environment-outcome }}" = "success"
           test "${{ needs.measure.outputs.measurement-outcome }}" = "success"
           test "${{ needs.measure.outputs.measurement-evidence-outcome }}" = "success"
           test "${{ steps.measurement-evidence-download.outcome }}" = "success"
+          test "${{ steps.attestation-hardening.outcome }}" = "success"
+          test "${{ steps.attestation-checkout.outcome }}" = "success"
+          test "${{ steps.attestation-environment.outcome }}" = "success"
           test "${{ steps.oidc.outcome }}" = "success"
+          test "${{ steps.workflow-outcome.outcome }}" = "success"
           test "${{ steps.terminal-evidence.outcome }}" = "success"
           test -f "$RUNNER_TEMP/terminal-evidence/hf-oidc-receipt.json"
           test ! -f "$RUNNER_TEMP/terminal-evidence/hf-workflow-stage-failure.json"

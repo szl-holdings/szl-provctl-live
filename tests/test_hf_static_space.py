@@ -1114,6 +1114,9 @@ class StaticSpaceContractTests(unittest.TestCase):
         deploy_steps = {
             step.get("id"): step for step in jobs["deploy"]["steps"] if step.get("id")
         }
+        measure_steps = {
+            step.get("id"): step for step in jobs["measure"]["steps"] if step.get("id")
+        }
         attest_steps = {
             step.get("id"): step for step in jobs["attest"]["steps"] if step.get("id")
         }
@@ -1140,6 +1143,15 @@ class StaticSpaceContractTests(unittest.TestCase):
         )
         self.assertIn(
             "steps.measurement-evidence-download.outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
+        self.assertEqual(jobs["measure"]["needs"], ["authorize", "deploy"])
+        self.assertIn(
+            "needs.measure.outputs.measurement-rebind-outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
+        self.assertIn(
+            "needs.measure.outputs.measurement-environment-outcome == 'success'",
             attest_steps["oidc"]["if"],
         )
         self.assertNotIn("HF_TOKEN", authorize_text)
@@ -1177,6 +1189,12 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertIn("--publisher-evidence-outcome", workflow)
         self.assertIn("--publisher-evidence-download-outcome", workflow)
         self.assertIn("--measurement-evidence-download-outcome", workflow)
+        self.assertIn("--measurement-hardening-outcome", workflow)
+        self.assertIn("--measurement-input-outcome", workflow)
+        self.assertIn("--measurement-rebind-outcome", workflow)
+        self.assertIn("--measurement-publisher-evidence-outcome", workflow)
+        self.assertIn("--measurement-environment-outcome", workflow)
+        self.assertIn("--attestation-checkout-outcome", workflow)
         self.assertIn("--authorization", workflow)
         self.assertIn("--authorization-output", workflow)
         self.assertIn("Require terminal governed success", workflow)
@@ -1217,6 +1235,72 @@ class StaticSpaceContractTests(unittest.TestCase):
                 "publisher-rebind.outcome == 'success'",
                 deploy_steps[positions[step_name]].get("if", ""),
             )
+        publish_run = deploy_steps[positions[
+            "Publish exact bundle with only the Hugging Face credential"
+        ]]["run"]
+        self.assertIn("/usr/bin/env -i", publish_run)
+        isolated = publish_run.split("/usr/bin/env -i", 1)[1].split(
+            '"$PUBLISHER_PYTHON"', 1
+        )[0]
+        assignments = set(
+            re.findall(r"(?m)^\s*([A-Z][A-Z0-9_]*)=", isolated)
+        )
+        self.assertEqual(
+            assignments,
+            {
+                "HOME",
+                "HF_HOME",
+                "XDG_CACHE_HOME",
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "PYTHONIOENCODING",
+                "HF_TOKEN",
+            },
+        )
+        for forbidden in (
+            "ACTIONS_",
+            "GITHUB_ENV",
+            "GITHUB_OUTPUT",
+            "GITHUB_PATH",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+        ):
+            self.assertNotIn(forbidden, isolated)
+
+        measurement_rebind = measure_steps["measurement-rebind"]
+        self.assertEqual(
+            set(measurement_rebind["env"]),
+            {
+                "EXPECTED_PUBLISHER_SCRIPT_SHA256",
+                "EXPECTED_PUBLISHER_LOCK_SHA256",
+                "EXPECTED_PUBLISHER_CONFIG_SHA256",
+                "EXPECTED_AUTHORIZATION_SHA256",
+                "EXPECTED_BUNDLE_MANIFEST_SHA256",
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                "HF_TOKEN",
+            },
+        )
+        self.assertEqual(measurement_rebind["run"].count("require_digest \"$EXPECTED_"), 5)
+        self.assertIn(
+            "steps.measurement-rebind.outcome == 'success'",
+            measure_steps["measurement-publisher-evidence"]["if"],
+        )
+        self.assertIn(
+            "steps.measurement-environment.outcome == 'success'",
+            measure_steps["measurement"]["if"],
+        )
+
+        outcome_step = attest_steps["workflow-outcome"]
+        self.assertIs(outcome_step["continue-on-error"], True)
+        self.assertIn("terminal_synthesizer_bootstrap", outcome_step["run"])
+        self.assertIn("hf-workflow-stage-failure.json", outcome_step["run"])
+        for step in jobs["attest"]["steps"]:
+            if step.get("id") == "oidc":
+                continue
+            self.assertEqual(step.get("env", {}).get("ACTIONS_ID_TOKEN_REQUEST_TOKEN"), "")
+            self.assertEqual(step.get("env", {}).get("ACTIONS_ID_TOKEN_REQUEST_URL"), "")
         self.assertIn("publisher_executable_rebind", SCRIPT.read_text(encoding="utf-8"))
 
     def test_rebind_failure_is_terminal_before_mutation(self) -> None:
@@ -1517,6 +1601,22 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertNotIn("raw-secret", diagnostic)
         self.assertIn("<redacted>", diagnostic)
 
+        secret = "hf_secret/with+chars"
+        representations = (
+            f"Authorization: Bearer {secret}",
+            f"headers={{'Authorization': 'Bearer {secret}'}}",
+            "https://example.invalid/read?token=" + urllib.parse.quote(secret, safe=""),
+            f"api_key={secret}",
+        )
+        for representation in representations:
+            with self.subTest(representation=representation):
+                redacted = MODULE._sanitized_diagnostic(
+                    RuntimeError(representation), (secret,)
+                )
+                self.assertNotIn(secret, redacted)
+                self.assertNotIn(urllib.parse.quote(secret, safe=""), redacted)
+                self.assertIn("<redacted>", redacted)
+
     def test_request_timeout_is_capped_by_remaining_deadline(self) -> None:
         with mock.patch.object(MODULE.time, "monotonic", return_value=100.0):
             self.assertEqual(
@@ -1751,7 +1851,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             measurement_path.write_bytes(MODULE.canonical_json(measurement))
             cases = (
                 ("failure", "skipped", "", "measurement_evidence_upload"),
-                ("success", "failure", "", "oidc_attestation"),
+            ("success", "failure", "", "oidc_attestation"),
                 ("success", "success", "terminal_evidence_upload", "terminal_evidence_upload"),
             )
             for success_evidence, oidc, forced, expected_stage in cases:
@@ -1801,6 +1901,32 @@ class StaticSpaceContractTests(unittest.TestCase):
             (
                 {"measurement_evidence_download_outcome": "failure"},
                 "measurement_evidence_download",
+            ),
+            ({"measurement_hardening_outcome": "failure"}, "measurement_hardening"),
+            ({"measurement_input_outcome": "failure"}, "measurement_input"),
+            (
+                {"measurement_rebind_outcome": "failure"},
+                "measurement_executable_rebind",
+            ),
+            (
+                {"measurement_publisher_evidence_outcome": "failure"},
+                "measurement_publisher_evidence_download",
+            ),
+            (
+                {"measurement_environment_outcome": "failure"},
+                "measurement_environment",
+            ),
+            (
+                {"attestation_hardening_outcome": "failure"},
+                "attestation_hardening",
+            ),
+            (
+                {"attestation_checkout_outcome": "failure"},
+                "attestation_checkout",
+            ),
+            (
+                {"attestation_environment_outcome": "failure"},
+                "attestation_environment",
             ),
         )
         with tempfile.TemporaryDirectory() as temporary:

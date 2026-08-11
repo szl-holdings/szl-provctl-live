@@ -1542,6 +1542,7 @@ def _write_mutation_failure(
     manifest: dict | None,
     mutation_state: dict[str, object],
     error: BaseException,
+    sensitive_values: tuple[str, ...] = (),
 ) -> dict:
     upload_entered = mutation_state.get("upload_call_entered") is True
     known_revision = mutation_state.get("known_hf_revision")
@@ -1568,7 +1569,7 @@ def _write_mutation_failure(
         ),
         "receipt_minted": False,
         "deployment_success": False,
-        "diagnostic": _sanitized_diagnostic(error),
+        "diagnostic": _sanitized_diagnostic(error, sensitive_values),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json(evidence))
@@ -1586,6 +1587,7 @@ def deploy_bundle(
     mutation_state: dict[str, object] | None = None,
 ) -> dict:
     requested_source_sha = str(source_sha or "")
+    hf_token = os.environ.get("HF_TOKEN", "")
     state = mutation_state if mutation_state is not None else {}
     state.update(
         {
@@ -1604,7 +1606,7 @@ def deploy_bundle(
         authorization = load_governed_merge(
             authorization_path, source_sha, config_path
         )
-        token = os.environ.get("HF_TOKEN", "")
+        token = hf_token
         if not token:
             raise ContractError(
                 "HF_TOKEN is unavailable in the approved repository secret store"
@@ -1658,7 +1660,8 @@ def deploy_bundle(
             except Exception as readback_error:
                 raise ContractError(
                     "upload outcome is ambiguous and exact authoritative readback "
-                    f"did not close it: {_sanitized_diagnostic(readback_error)}"
+                    "did not close it: "
+                    f"{_sanitized_diagnostic(readback_error, (hf_token,))}"
                 ) from upload_error
             upload_transport = "AMBIGUOUS_RECOVERED_BY_EXACT_READBACK"
         state["known_hf_revision"] = target_sha
@@ -1685,13 +1688,15 @@ def deploy_bundle(
                 manifest,
                 state,
                 error,
+                (hf_token,),
             )
         except Exception as evidence_error:
             raise ContractError(
                 "publisher mutation failed and mandatory machine-readable evidence "
                 "could not be persisted; "
-                f"mutation={_sanitized_diagnostic(error)}; "
-                f"evidence_write={_sanitized_diagnostic(evidence_error)}"
+                f"mutation={_sanitized_diagnostic(error, (hf_token,))}; "
+                "evidence_write="
+                f"{_sanitized_diagnostic(evidence_error, (hf_token,))}"
             ) from evidence_error
         raise ContractError(
             "publisher mutation failed closed; canonical machine-readable evidence "
@@ -1699,12 +1704,29 @@ def deploy_bundle(
         ) from error
 
 
-def _sanitized_diagnostic(error: BaseException) -> str:
+def _sanitized_diagnostic(
+    error: BaseException, sensitive_values: tuple[str, ...] = ()
+) -> str:
     message = f"{type(error).__name__}: {error}"
+    for value in sorted(
+        {value for value in sensitive_values if value}, key=len, reverse=True
+    ):
+        message = message.replace(value, "<redacted>")
     message = " ".join(message.replace("\x00", " ").split())
     message = re.sub(
-        r"(?i)(authorization|token|secret|private[-_ ]?key)(\s*[:=]\s*)\S+",
-        r"\1\2<redacted>",
+        r"(?i)\bBearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)",
+        "Bearer <redacted>",
+        message,
+    )
+    message = re.sub(
+        r"(?i)([?&](?:access[-_])?(?:token|secret|key)=)[^&#\s]+",
+        r"\1<redacted>",
+        message,
+    )
+    message = re.sub(
+        r"(?i)([\"']?(?:authorization|token|secret|private[-_ ]?key|api[-_ ]?key)"
+        r"[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)",
+        r"\1<redacted>",
         message,
     )
     return message[:500]
@@ -2079,9 +2101,18 @@ def write_workflow_stage_failure(
         "publisher_environment",
         "publisher_mutation",
         "publisher_evidence_upload",
+        "measurement_hardening",
+        "measurement_input",
+        "measurement_executable_rebind",
+        "measurement_publisher_evidence_download",
+        "measurement_environment",
         "local_measurement",
         "measurement_evidence_upload",
+        "attestation_hardening",
+        "attestation_checkout",
+        "attestation_environment",
         "oidc_attestation",
+        "terminal_synthesizer_bootstrap",
         "terminal_evidence_upload",
     }
     if failure_stage not in permitted:
@@ -2126,7 +2157,15 @@ def synthesize_workflow_outcome(
     publisher_environment_outcome: str = "success",
     publisher_evidence_outcome: str = "success",
     publisher_evidence_download_outcome: str = "success",
+    measurement_hardening_outcome: str = "success",
+    measurement_input_outcome: str = "success",
+    measurement_rebind_outcome: str = "success",
+    measurement_publisher_evidence_outcome: str = "success",
+    measurement_environment_outcome: str = "success",
     measurement_evidence_download_outcome: str = "success",
+    attestation_hardening_outcome: str = "success",
+    attestation_checkout_outcome: str = "success",
+    attestation_environment_outcome: str = "success",
 ) -> dict:
     source_sha = exact_sha(source_sha)
     config = load_config(config_path)
@@ -2157,9 +2196,17 @@ def synthesize_workflow_outcome(
         "publisher_mutation": publish_outcome,
         "publisher_evidence_upload": publisher_evidence_outcome,
         "publisher_evidence_download": publisher_evidence_download_outcome,
+        "measurement_hardening": measurement_hardening_outcome,
+        "measurement_input": measurement_input_outcome,
+        "measurement_executable_rebind": measurement_rebind_outcome,
+        "measurement_publisher_evidence_download": measurement_publisher_evidence_outcome,
+        "measurement_environment": measurement_environment_outcome,
         "local_measurement": measurement_outcome,
         "measurement_evidence_upload": success_evidence_outcome,
         "measurement_evidence_download": measurement_evidence_download_outcome,
+        "attestation_hardening": attestation_hardening_outcome,
+        "attestation_checkout": attestation_checkout_outcome,
+        "attestation_environment": attestation_environment_outcome,
         "oidc_attestation": oidc_outcome,
     }
     observed_source = measurement.get("source") if measurement else None
@@ -2294,7 +2341,15 @@ def main() -> int:
     outcome.add_argument("--publisher-environment-outcome", default="success")
     outcome.add_argument("--publisher-evidence-outcome", default="success")
     outcome.add_argument("--publisher-evidence-download-outcome", default="success")
+    outcome.add_argument("--measurement-hardening-outcome", default="success")
+    outcome.add_argument("--measurement-input-outcome", default="success")
+    outcome.add_argument("--measurement-rebind-outcome", default="success")
+    outcome.add_argument("--measurement-publisher-evidence-outcome", default="success")
+    outcome.add_argument("--measurement-environment-outcome", default="success")
     outcome.add_argument("--measurement-evidence-download-outcome", default="success")
+    outcome.add_argument("--attestation-hardening-outcome", default="success")
+    outcome.add_argument("--attestation-checkout-outcome", default="success")
+    outcome.add_argument("--attestation-environment-outcome", default="success")
     outcome.add_argument("--attestation-id", default="")
     outcome.add_argument("--attestation-url", default="")
     outcome.add_argument("--force-failure-stage", default="")
@@ -2365,7 +2420,15 @@ def main() -> int:
             publisher_environment_outcome=args.publisher_environment_outcome,
             publisher_evidence_outcome=args.publisher_evidence_outcome,
             publisher_evidence_download_outcome=args.publisher_evidence_download_outcome,
+            measurement_hardening_outcome=args.measurement_hardening_outcome,
+            measurement_input_outcome=args.measurement_input_outcome,
+            measurement_rebind_outcome=args.measurement_rebind_outcome,
+            measurement_publisher_evidence_outcome=args.measurement_publisher_evidence_outcome,
+            measurement_environment_outcome=args.measurement_environment_outcome,
             measurement_evidence_download_outcome=args.measurement_evidence_download_outcome,
+            attestation_hardening_outcome=args.attestation_hardening_outcome,
+            attestation_checkout_outcome=args.attestation_checkout_outcome,
+            attestation_environment_outcome=args.attestation_environment_outcome,
         )
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
     return 0
