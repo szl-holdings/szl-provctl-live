@@ -28,12 +28,100 @@ TARGET_SHA = "c" * 40
 PR_HEAD_SHA = "d" * 40
 RELEASE_RUN_ID = 98
 BOUNDARY_RUN_ID = 99
+RELEASE_CHECK_SUITE_ID = 198
+BOUNDARY_CHECK_SUITE_ID = 199
+
+
+def exact_pr_body(repository: str, head_sha: str = PR_HEAD_SHA) -> str:
+    payload = {
+        "head_revision": head_sha,
+        "repository": repository,
+        "schema": MODULE.PR_BODY_MARKER_SCHEMA,
+    }
+    marker = (
+        MODULE.PR_BODY_MARKER_PREFIX
+        + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + MODULE.PR_BODY_MARKER_SUFFIX
+    )
+    return f"Release evidence for the exact reviewed head.\n\n{marker}\n"
+
+
+def exact_job_evidence(
+    name: str,
+    job_id: int,
+    run_id: int,
+    run_attempt: int,
+    check_suite_id: int,
+    conclusion: str = "success",
+) -> dict:
+    return {
+        "app_id": MODULE.GITHUB_ACTIONS_INTEGRATION_ID,
+        "check_run_id": job_id,
+        "check_suite_id": check_suite_id,
+        "conclusion": conclusion,
+        "head_revision": PR_HEAD_SHA,
+        "job_id": job_id,
+        "name": name,
+        "run_attempt": run_attempt,
+        "run_id": run_id,
+        "status": "completed",
+    }
+
+
+def exact_workflow_evidence(
+    repository: str,
+    *,
+    run_id: int,
+    run_attempt: int,
+    check_suite_id: int,
+    workflow_id: int,
+    workflow_name: str,
+    workflow_path: str,
+    jobs: list[dict],
+) -> dict:
+    return {
+        "base_revision": PARENT_SHA,
+        "check_suite_id": check_suite_id,
+        "conclusion": "success",
+        "event": "pull_request",
+        "head_ref": "release-candidate",
+        "head_revision": PR_HEAD_SHA,
+        "jobs": sorted(jobs, key=lambda row: (row["name"], row["job_id"])),
+        "name": workflow_name,
+        "path": workflow_path,
+        "pull_request_number": 7,
+        "repository_id": MODULE.TARGET_REPOSITORY_IDS[repository],
+        "run_attempt": run_attempt,
+        "run_id": run_id,
+        "status": "completed",
+        "workflow_id": workflow_id,
+    }
 
 
 def governed_merge_evidence(source_sha: str = SOURCE_SHA) -> dict:
     repository = MODULE.load_config()["source_repository"]
+    body = exact_pr_body(repository)
+    release_jobs = [
+        exact_job_evidence(
+            name,
+            index + 10,
+            RELEASE_RUN_ID,
+            1,
+            RELEASE_CHECK_SUITE_ID,
+        )
+        for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS))
+    ]
+    boundary_jobs = [
+        exact_job_evidence(
+            "release-boundary-required",
+            20,
+            BOUNDARY_RUN_ID,
+            1,
+            BOUNDARY_CHECK_SUITE_ID,
+        )
+    ]
     return {
-        "schema": "szl.github-governed-merge/v2",
+        "schema": MODULE.GOVERNED_MERGE_SCHEMA,
         "status": "AUTHORIZED_EXACT_GOVERNED_MERGE",
         "source_revision": source_sha,
         "repository": {
@@ -44,54 +132,41 @@ def governed_merge_evidence(source_sha: str = SOURCE_SHA) -> dict:
         "push": {"before": PARENT_SHA, "after": source_sha},
         "pull_request": {
             "base_revision": PARENT_SHA,
+            "body_evidence": {
+                "body_sha256": MODULE.sha256_bytes(body.encode("utf-8")),
+                "head_revision": PR_HEAD_SHA,
+                "repository": repository,
+                "schema": MODULE.PR_BODY_EVIDENCE_SCHEMA,
+            },
             "head_ref": "release-candidate",
             "head_revision": PR_HEAD_SHA,
+            "id": 70,
             "merge_revision": source_sha,
             "merged_at": "2026-08-10T00:00:00Z",
             "merged_by": "solo-owner",
             "number": 7,
         },
-        "required_checks": [
-            {
-                "app_id": MODULE.GITHUB_ACTIONS_INTEGRATION_ID,
-                "check_run_id": index + 10,
-                "conclusion": "success",
-                "head_revision": PR_HEAD_SHA,
-                "name": name,
-                "workflow_run_id": RELEASE_RUN_ID,
-            }
-            for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS))
-        ],
-        "release_workflow": {
-            "base_revision": PARENT_SHA,
-            "conclusion": "success",
-            "event": "pull_request",
-            "head_ref": "release-candidate",
-            "head_revision": PR_HEAD_SHA,
-            "name": MODULE.RELEASE_WORKFLOW_NAME,
-            "path": MODULE.RELEASE_WORKFLOW_PATH,
-            "pull_request_number": 7,
-            "repository_id": MODULE.TARGET_REPOSITORY_IDS[repository],
-            "run_attempt": 1,
-            "run_id": RELEASE_RUN_ID,
-            "status": "completed",
-            "workflow_id": MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
-        },
-        "required_workflow": {
-            "base_revision": PARENT_SHA,
-            "conclusion": "success",
-            "event": "pull_request",
-            "head_ref": "release-candidate",
-            "head_revision": PR_HEAD_SHA,
-            "name": MODULE.REQUIRED_WORKFLOW_NAME,
-            "path": MODULE.REQUIRED_WORKFLOW_PATH,
-            "pull_request_number": 7,
-            "repository_id": MODULE.TARGET_REPOSITORY_IDS[repository],
-            "run_attempt": 1,
-            "run_id": BOUNDARY_RUN_ID,
-            "status": "completed",
-            "workflow_id": MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
-        },
+        "required_checks": sorted(release_jobs, key=lambda row: row["name"]),
+        "release_workflow": exact_workflow_evidence(
+            repository,
+            run_id=RELEASE_RUN_ID,
+            run_attempt=1,
+            check_suite_id=RELEASE_CHECK_SUITE_ID,
+            workflow_id=MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+            workflow_name=MODULE.RELEASE_WORKFLOW_NAME,
+            workflow_path=MODULE.RELEASE_WORKFLOW_PATH,
+            jobs=release_jobs,
+        ),
+        "required_workflow": exact_workflow_evidence(
+            repository,
+            run_id=BOUNDARY_RUN_ID,
+            run_attempt=1,
+            check_suite_id=BOUNDARY_CHECK_SUITE_ID,
+            workflow_id=MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
+            workflow_name=MODULE.REQUIRED_WORKFLOW_NAME,
+            workflow_path=MODULE.REQUIRED_WORKFLOW_PATH,
+            jobs=boundary_jobs,
+        ),
     }
 
 
@@ -129,28 +204,46 @@ def guard_responder(
     stale_boundary_success: bool = False,
     stale_check_success: bool = False,
     misbound_boundary: bool = False,
+    associated_pages: list[list[dict]] | None = None,
+    associated_second_pages: list[list[dict]] | None = None,
+    initial_body: str | None = None,
+    final_body: str | None = None,
+    release_attempt: int = 1,
+    current_release_attempt: int | None = None,
+    wrong_job_run: bool = False,
+    wrong_check_suite: bool = False,
+    wrong_check_url: bool = False,
+    final_main_sha: str = SOURCE_SHA,
 ):
     repository = MODULE.load_config()["source_repository"]
     repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
-    pull = {
-        "id": 70,
-        "number": 7,
-        "state": "closed",
-        "merged": True,
-        "merged_at": "2026-08-10T00:00:00Z",
-        "merge_commit_sha": SOURCE_SHA,
-        "merged_by": {"login": "solo-owner"},
-        "base": {
-            "ref": "main",
-            "sha": PARENT_SHA,
-            "repo": {"full_name": repository, "id": repository_id},
-        },
-        "head": {
-            "ref": "release-candidate",
-            "sha": PR_HEAD_SHA,
-            "repo": {"full_name": repository, "id": repository_id},
-        },
-    }
+    body = initial_body if initial_body is not None else exact_pr_body(repository)
+    final_body = body if final_body is None else final_body
+    branch_calls = 0
+    pull_calls = 0
+    associated_scan = -1
+
+    def full_pull(pull_body: str) -> dict:
+        return {
+            "id": 70,
+            "number": 7,
+            "state": "closed",
+            "merged": True,
+            "merged_at": "2026-08-10T00:00:00Z",
+            "merge_commit_sha": SOURCE_SHA,
+            "merged_by": {"login": "solo-owner"},
+            "body": pull_body,
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"full_name": repository, "id": repository_id},
+            },
+            "head": {
+                "ref": "release-candidate",
+                "sha": PR_HEAD_SHA,
+                "repo": {"full_name": repository, "id": repository_id},
+            },
+        }
 
     def run_pull(number: int = 7) -> dict:
         return {
@@ -173,6 +266,8 @@ def guard_responder(
         name: str,
         path: str,
         conclusion: str,
+        attempt: int,
+        check_suite_id: int,
         *,
         pull_number: int = 7,
     ) -> dict:
@@ -183,104 +278,184 @@ def guard_responder(
             "path": path,
             "event": "pull_request",
             "head_sha": PR_HEAD_SHA,
-            "status": "completed",
-            "conclusion": conclusion,
-            "run_attempt": 1,
+            "status": "completed" if conclusion != "in_progress" else "in_progress",
+            "conclusion": None if conclusion == "in_progress" else conclusion,
+            "run_attempt": attempt,
+            "check_suite_id": check_suite_id,
             "repository": {"full_name": repository, "id": repository_id},
             "pull_requests": [run_pull(pull_number)],
         }
 
+    def release_run(attempt: int = release_attempt) -> dict:
+        return workflow_run(
+            RELEASE_RUN_ID,
+            MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+            MODULE.RELEASE_WORKFLOW_NAME,
+            MODULE.RELEASE_WORKFLOW_PATH,
+            release_conclusion,
+            attempt,
+            RELEASE_CHECK_SUITE_ID,
+        )
+
+    def boundary_run(
+        run_id: int = BOUNDARY_RUN_ID,
+        conclusion: str = boundary_conclusion,
+    ) -> dict:
+        return workflow_run(
+            run_id,
+            MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
+            MODULE.REQUIRED_WORKFLOW_NAME,
+            MODULE.REQUIRED_WORKFLOW_PATH,
+            conclusion,
+            1,
+            BOUNDARY_CHECK_SUITE_ID if run_id == BOUNDARY_RUN_ID else BOUNDARY_CHECK_SUITE_ID + 100,
+            pull_number=8 if misbound_boundary else 7,
+        )
+
+    def workflow_rows() -> list[dict]:
+        rows = [release_run()]
+        if stale_boundary_success:
+            rows.append(boundary_run(BOUNDARY_RUN_ID, "success"))
+            rows.append(boundary_run(BOUNDARY_RUN_ID + 100, boundary_conclusion))
+        else:
+            rows.append(boundary_run())
+        return rows
+
+    def job(
+        job_id: int,
+        run_id: int,
+        workflow_name: str,
+        name: str,
+    ) -> dict:
+        actual_run_id = run_id + 500 if wrong_job_run and run_id == RELEASE_RUN_ID else run_id
+        check_id = job_id + 500 if wrong_check_url and run_id == RELEASE_RUN_ID else job_id
+        return {
+            "id": job_id,
+            "run_id": actual_run_id,
+            "run_url": f"https://api.github.test/repos/{repository}/actions/runs/{run_id}",
+            "head_sha": PR_HEAD_SHA,
+            "workflow_name": workflow_name,
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": f"https://github.com/{repository}/actions/runs/{run_id}/job/{job_id}",
+            "check_run_url": f"https://api.github.test/repos/{repository}/check-runs/{check_id}",
+        }
+
+    release_jobs = [
+        job(index + 10, RELEASE_RUN_ID, MODULE.RELEASE_WORKFLOW_NAME, name)
+        for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS))
+    ]
+    boundary_jobs = [
+        job(20, BOUNDARY_RUN_ID, MODULE.REQUIRED_WORKFLOW_NAME, "release-boundary-required")
+    ]
+
+    def checks_for(jobs: list[dict], suite_id: int) -> list[dict]:
+        rows = []
+        for item in jobs:
+            check_id = (
+                item["id"]
+                if wrong_check_url and suite_id == RELEASE_CHECK_SUITE_ID
+                else int(item["check_run_url"].rsplit("/", 1)[1])
+            )
+            conclusion = (
+                "failure"
+                if stale_check_success and suite_id == RELEASE_CHECK_SUITE_ID
+                else item["conclusion"]
+            )
+            rows.append(
+                {
+                    "id": check_id,
+                    "name": item["name"],
+                    "head_sha": PR_HEAD_SHA,
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "url": item["check_run_url"],
+                    "details_url": item["html_url"],
+                    "check_suite": {
+                        "id": suite_id + 500
+                        if wrong_check_suite and suite_id == RELEASE_CHECK_SUITE_ID
+                        else suite_id
+                    },
+                    "app": {"id": check_app_id},
+                }
+            )
+        return rows
+
+    initial_pull = full_pull(body)
+    if associated_pages is None:
+        associated_pages = [[copy.deepcopy(initial_pull)]]
+    if associated_second_pages is None:
+        associated_second_pages = copy.deepcopy(associated_pages)
+
     def respond(url: str, token: str = "") -> object:
+        nonlocal associated_scan, branch_calls, pull_calls
         if token != "github-test-token":
             raise AssertionError("guard omitted its GitHub credential")
-        if url.endswith(f"/repos/{repository}"):
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        path = parsed.path
+        if path == f"/repos/{repository}":
             return {
                 "id": repository_id,
                 "full_name": repository,
                 "default_branch": "main",
             }
-        if url.endswith(f"/repos/{repository}/branches/main"):
-            return {"commit": {"sha": SOURCE_SHA}}
-        if url.endswith(f"/repos/{repository}/commits/{SOURCE_SHA}/pulls"):
-            return [pull]
-        if url.endswith(f"/repos/{repository}/pulls/7"):
-            return pull
-        if f"/repos/{repository}/actions/runs?" in url:
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        if path == f"/repos/{repository}/branches/main":
+            branch_calls += 1
+            return {"commit": {"sha": SOURCE_SHA if branch_calls == 1 else final_main_sha}}
+        if path == f"/repos/{repository}/commits/{SOURCE_SHA}/pulls":
+            page = int(query.get("page", ["1"])[0])
+            if page == 1:
+                associated_scan += 1
+            pages = associated_pages if associated_scan == 0 else associated_second_pages
+            return copy.deepcopy(pages[page - 1] if page <= len(pages) else [])
+        if path == f"/repos/{repository}/pulls/7":
+            pull_calls += 1
+            return full_pull(body if pull_calls == 1 else final_body)
+        if path == f"/repos/{repository}/actions/runs":
             if query.get("head_sha") != [PR_HEAD_SHA] or query.get("event") != [
                 "pull_request"
             ]:
                 raise AssertionError("workflow query is not exact")
-            runs = [
-                workflow_run(
-                    RELEASE_RUN_ID,
-                    MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
-                    MODULE.RELEASE_WORKFLOW_NAME,
-                    MODULE.RELEASE_WORKFLOW_PATH,
-                    release_conclusion,
+            rows = workflow_rows()
+            return {"total_count": len(rows), "workflow_runs": rows}
+        if path == f"/repos/{repository}/actions/runs/{RELEASE_RUN_ID}/attempts/{release_attempt}":
+            return release_run()
+        if path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID}/attempts/1":
+            return boundary_run()
+        if stale_boundary_success and path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID + 100}/attempts/1":
+            return boundary_run(BOUNDARY_RUN_ID + 100, boundary_conclusion)
+        if path == f"/repos/{repository}/actions/runs/{RELEASE_RUN_ID}/attempts/{release_attempt}/jobs":
+            return {"total_count": len(release_jobs), "jobs": copy.deepcopy(release_jobs)}
+        if path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID}/attempts/1/jobs":
+            return {"total_count": len(boundary_jobs), "jobs": copy.deepcopy(boundary_jobs)}
+        if stale_boundary_success and path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID + 100}/attempts/1/jobs":
+            stale_jobs = [
+                job(
+                    120,
+                    BOUNDARY_RUN_ID + 100,
+                    MODULE.REQUIRED_WORKFLOW_NAME,
+                    "release-boundary-required",
                 )
             ]
-            if stale_boundary_success:
-                runs.append(
-                    workflow_run(
-                        BOUNDARY_RUN_ID,
-                        MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
-                        MODULE.REQUIRED_WORKFLOW_NAME,
-                        MODULE.REQUIRED_WORKFLOW_PATH,
-                        "success",
-                    )
-                )
-                boundary_run_id = BOUNDARY_RUN_ID + 100
-            else:
-                boundary_run_id = BOUNDARY_RUN_ID
-            runs.append(
-                workflow_run(
-                    boundary_run_id,
-                    MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
-                    MODULE.REQUIRED_WORKFLOW_NAME,
-                    MODULE.REQUIRED_WORKFLOW_PATH,
-                    boundary_conclusion,
-                    pull_number=8 if misbound_boundary else 7,
-                )
+            return {"total_count": 1, "jobs": stale_jobs}
+        if path == f"/repos/{repository}/check-suites/{RELEASE_CHECK_SUITE_ID}/check-runs":
+            rows = checks_for(release_jobs, RELEASE_CHECK_SUITE_ID)
+            return {"total_count": len(rows), "check_runs": rows}
+        if path == f"/repos/{repository}/check-suites/{BOUNDARY_CHECK_SUITE_ID}/check-runs":
+            rows = checks_for(boundary_jobs, BOUNDARY_CHECK_SUITE_ID)
+            return {"total_count": len(rows), "check_runs": rows}
+        if path == f"/repos/{repository}/actions/runs/{RELEASE_RUN_ID}":
+            return release_run(
+                release_attempt
+                if current_release_attempt is None
+                else current_release_attempt
             )
-            return {"total_count": len(runs), "workflow_runs": runs}
-        if url.endswith(
-            f"/repos/{repository}/commits/{PR_HEAD_SHA}/check-runs?per_page=100"
-        ):
-            checks = []
-            for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS)):
-                check_id = index + 10
-                checks.append(
-                    {
-                        "id": check_id,
-                        "name": name,
-                        "head_sha": PR_HEAD_SHA,
-                        "status": "completed",
-                        "conclusion": "success",
-                        "app": {"id": check_app_id},
-                        "details_url": (
-                            f"https://github.com/{repository}/actions/runs/"
-                            f"{RELEASE_RUN_ID}/job/{check_id}"
-                        ),
-                    }
-                )
-                if stale_check_success:
-                    latest_id = check_id + 100
-                    checks.append(
-                        {
-                            "id": latest_id,
-                            "name": name,
-                            "head_sha": PR_HEAD_SHA,
-                            "status": "completed",
-                            "conclusion": "failure",
-                            "app": {"id": check_app_id},
-                            "details_url": (
-                                f"https://github.com/{repository}/actions/runs/"
-                                f"{RELEASE_RUN_ID}/job/{latest_id}"
-                            ),
-                        }
-                    )
-            return {"total_count": len(checks), "check_runs": checks}
+        if path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID}":
+            return boundary_run()
+        if stale_boundary_success and path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID + 100}":
+            return boundary_run(BOUNDARY_RUN_ID + 100, boundary_conclusion)
         raise AssertionError(f"unexpected guard URL: {url}")
 
     return respond
@@ -454,8 +629,18 @@ class StaticSpaceContractTests(unittest.TestCase):
                         failure_output_path=failure_path,
                     )
             self.assertEqual(result["status"], "AUTHORIZED_EXACT_GOVERNED_MERGE")
+            self.assertEqual(result["schema"], MODULE.GOVERNED_MERGE_SCHEMA)
             self.assertEqual(result["push"], {"before": PARENT_SHA, "after": SOURCE_SHA})
             self.assertEqual(result["pull_request"]["head_revision"], PR_HEAD_SHA)
+            self.assertEqual(
+                result["pull_request"]["body_evidence"]["schema"],
+                MODULE.PR_BODY_EVIDENCE_SCHEMA,
+            )
+            self.assertEqual(result["release_workflow"]["run_attempt"], 1)
+            self.assertEqual(
+                {row["name"] for row in result["release_workflow"]["jobs"]},
+                set(MODULE.REQUIRED_STATUS_CONTEXTS),
+            )
             self.assertEqual(
                 result["required_workflow"]["workflow_id"],
                 MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
@@ -495,12 +680,12 @@ class StaticSpaceContractTests(unittest.TestCase):
                 (
                     "stale check success",
                     guard_responder(stale_check_success=True),
-                    "latest exact publisher-workflow check",
+                    "job/check binding",
                 ),
                 (
                     "misbound boundary",
                     guard_responder(misbound_boundary=True),
-                    "pull-request tuple is not exact",
+                    "exact required release-boundary workflow did not run",
                 ),
                 (
                     "failed publisher workflow",
@@ -510,7 +695,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                 (
                     "wrong check app",
                     guard_responder(check_app_id=99),
-                    "required exact publisher-workflow check",
+                    "job/check binding",
                 ),
             ]
             with mock.patch.dict(os.environ, environment, clear=False):
@@ -541,6 +726,226 @@ class StaticSpaceContractTests(unittest.TestCase):
                             failure_output_path=root / "direct-failure.json",
                         )
 
+    def test_guard_paginates_complete_stable_associated_pr_inventory(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        candidate = {
+            "id": 70,
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-10T00:00:00Z",
+            "merge_commit_sha": SOURCE_SHA,
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"full_name": repository},
+            },
+        }
+        noise = [{"id": 1000 + index, "state": "open"} for index in range(100)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    MODULE,
+                    "_request_json",
+                    side_effect=guard_responder(
+                        associated_pages=[noise, [candidate]],
+                    ),
+                ):
+                    result = MODULE.require_governed_main(
+                        SOURCE_SHA, event_path, root / "authorization.json"
+                    )
+            self.assertEqual(result["pull_request"]["id"], 70)
+
+    def test_guard_rejects_incomplete_ambiguous_or_drifting_pr_inventory(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        candidate = {
+            "id": 70,
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-10T00:00:00Z",
+            "merge_commit_sha": SOURCE_SHA,
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"full_name": repository},
+            },
+        }
+        second = copy.deepcopy(candidate)
+        second.update({"id": 71, "number": 8})
+        noise = [{"id": 1000 + index, "state": "open"} for index in range(99)]
+        duplicate_page = [{"id": 1000, "state": "open"}]
+        variants = [
+            (
+                "ambiguous later page",
+                guard_responder(
+                    associated_pages=[[candidate, *noise], [second]]
+                ),
+                "unambiguous merged PR",
+            ),
+            (
+                "duplicate across pages",
+                guard_responder(
+                    associated_pages=[[candidate, *noise], duplicate_page]
+                ),
+                "malformed or duplicated",
+            ),
+            (
+                "snapshot drift",
+                guard_responder(
+                    associated_pages=[[candidate]],
+                    associated_second_pages=[
+                        [candidate, {"id": 72, "state": "open"}]
+                    ],
+                ),
+                "inventory changed",
+            ),
+            (
+                "main drift",
+                guard_responder(final_main_sha=TARGET_SHA),
+                "protected main changed",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                for label, responder, diagnostic in variants:
+                    with self.subTest(label=label):
+                        with mock.patch.object(
+                            MODULE, "_request_json", side_effect=responder
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.ContractError, diagnostic
+                            ):
+                                MODULE.require_governed_main(
+                                    SOURCE_SHA,
+                                    event_path,
+                                    root / f"{label}.json",
+                                )
+
+    def test_guard_rejects_attempt_job_and_check_misbinding(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        variants = [
+            ("job from another run", guard_responder(wrong_job_run=True), "job/check binding"),
+            ("check from another suite", guard_responder(wrong_check_suite=True), "job/check binding"),
+            ("job/check URL mismatch", guard_responder(wrong_check_url=True), "job/check binding"),
+            (
+                "new run attempt",
+                guard_responder(current_release_attempt=2),
+                "advanced after exact-attempt",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                for label, responder, diagnostic in variants:
+                    with self.subTest(label=label):
+                        with mock.patch.object(
+                            MODULE, "_request_json", side_effect=responder
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.ContractError, diagnostic
+                            ):
+                                MODULE.require_governed_main(
+                                    SOURCE_SHA,
+                                    event_path,
+                                    root / f"{label}.json",
+                                )
+
+    def test_exact_pr_body_marker_and_event_binding(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
+        body = exact_pr_body(repository)
+        evidence = MODULE.exact_pr_body_evidence(body, repository, PR_HEAD_SHA)
+        self.assertEqual(evidence["schema"], MODULE.PR_BODY_EVIDENCE_SCHEMA)
+        marker = body.strip().splitlines()[-1]
+        invalid = [
+            None,
+            body + marker + "\n",
+            body.replace(PR_HEAD_SHA, TARGET_SHA),
+            body.replace(repository, "szl-holdings/other"),
+            body.replace('"schema":"szl.pr-head/v1"', '"schema":"wrong"'),
+        ]
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(MODULE.ContractError):
+                    MODULE.exact_pr_body_evidence(value, repository, PR_HEAD_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "pull-event.json"
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "repository": {"id": repository_id, "full_name": repository},
+                        "pull_request": {
+                            "body": body,
+                            "head": {
+                                "sha": PR_HEAD_SHA,
+                                "repo": {
+                                    "id": repository_id,
+                                    "full_name": repository,
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                MODULE.validate_pr_body_event(PR_HEAD_SHA, event_path), evidence
+            )
+
+    def test_guard_rejects_pr_body_drift_after_exact_checks(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        body = exact_pr_body(repository)
+        changed = body.replace("Release evidence", "Changed release evidence")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    MODULE,
+                    "_request_json",
+                    side_effect=guard_responder(
+                        initial_body=body, final_body=changed
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.ContractError, "evidence changed"
+                    ):
+                        MODULE.require_governed_main(
+                            SOURCE_SHA, event_path, root / "authorization.json"
+                        )
+
     def test_governed_merge_evidence_is_canonical_and_source_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -557,6 +962,28 @@ class StaticSpaceContractTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(MODULE.ContractError, "not bound"):
                 MODULE.load_governed_merge(authorization, SOURCE_SHA)
+
+    def test_governed_merge_v3_rejects_body_and_job_binding_tamper(self) -> None:
+        variants = []
+        wrong_body = governed_merge_evidence()
+        wrong_body["pull_request"]["body_evidence"]["head_revision"] = TARGET_SHA
+        variants.append(wrong_body)
+        wrong_attempt = governed_merge_evidence()
+        wrong_attempt["release_workflow"]["jobs"][0]["run_attempt"] = 2
+        variants.append(wrong_attempt)
+        wrong_suite = governed_merge_evidence()
+        wrong_suite["required_workflow"]["jobs"][0]["check_suite_id"] += 1
+        variants.append(wrong_suite)
+        wrong_required = governed_merge_evidence()
+        wrong_required["required_checks"] = wrong_required["required_checks"][:-1]
+        variants.append(wrong_required)
+        with tempfile.TemporaryDirectory() as temporary:
+            authorization = Path(temporary) / "governed-merge.json"
+            for index, evidence in enumerate(variants):
+                with self.subTest(index=index):
+                    authorization.write_bytes(MODULE.canonical_json(evidence))
+                    with self.assertRaises(MODULE.ContractError):
+                        MODULE.load_governed_merge(authorization, SOURCE_SHA)
 
     def test_guard_api_error_fails_closed(self) -> None:
         with mock.patch.object(
@@ -649,6 +1076,11 @@ class StaticSpaceContractTests(unittest.TestCase):
         workflow = workflow_path.read_text(encoding="utf-8")
         document = yaml.safe_load(workflow)
         jobs = document["jobs"]
+        self.assertIn(
+            "types: [opened, synchronize, reopened, edited, ready_for_review]",
+            workflow,
+        )
+        self.assertIn("hf_static_space.py pr-body", workflow)
         validate_text = json.dumps(jobs["validate"], sort_keys=True)
         self.assertEqual(jobs["dco"]["name"], "DCO")
         self.assertEqual(jobs["validate"]["name"], "validate-static-space")
@@ -711,10 +1143,16 @@ class StaticSpaceContractTests(unittest.TestCase):
             attest_steps["oidc"]["if"],
         )
         self.assertNotIn("HF_TOKEN", authorize_text)
+        self.assertIn("publisher_script_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("publisher_lock_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("publisher_config_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("authorization_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("bundle_manifest_sha256", jobs["authorize"]["outputs"])
         self.assertIn("requirements/hf-validator.lock", validate_text)
         self.assertNotIn("requirements/hf-publisher.lock", validate_text)
         self.assertNotIn("huggingface_hub", validate_text)
         self.assertNotIn("${{ github.token }}", deploy_text)
+        self.assertNotIn("actions/checkout@", deploy_text)
         self.assertIn('"GITHUB_TOKEN": ""', deploy_text)
         self.assertIn('"HF_TOKEN": "${{ secrets.HF_TOKEN }}"', deploy_text)
         self.assertIn('"HF_TOKEN": ""', measure_text)
@@ -735,6 +1173,7 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertIn("--authorization-outcome", workflow)
         self.assertIn("--authorization-evidence-outcome", workflow)
         self.assertIn("--publisher-environment-outcome", workflow)
+        self.assertIn("--publisher-rebind-outcome", workflow)
         self.assertIn("--publisher-evidence-outcome", workflow)
         self.assertIn("--publisher-evidence-download-outcome", workflow)
         self.assertIn("--measurement-evidence-download-outcome", workflow)
@@ -746,6 +1185,64 @@ class StaticSpaceContractTests(unittest.TestCase):
             "a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32",
             workflow,
         )
+        deploy_steps = jobs["deploy"]["steps"]
+        positions = {step["name"]: index for index, step in enumerate(deploy_steps)}
+        rebind_name = "Rebind five publisher inputs before interpretation or credentials"
+        self.assertLess(
+            positions[rebind_name],
+            positions["Install pinned Hugging Face client without repository credentials"],
+        )
+        self.assertLess(
+            positions[rebind_name],
+            positions["Classify publisher-environment failure before credential materialization"],
+        )
+        self.assertLess(
+            positions[rebind_name],
+            positions["Publish exact bundle with only the Hugging Face credential"],
+        )
+        rebind_step = deploy_steps[positions[rebind_name]]
+        self.assertNotIn("HF_TOKEN", rebind_step["env"])
+        self.assertNotIn("python", rebind_step["run"])
+        self.assertNotRegex(
+            rebind_step["run"],
+            r"(?mi)(?:^|[;&|])\s*(?:pip3?|python(?:3(?:\.\d+)?)?\s+-m\s+pip)\b",
+        )
+        for step_name in (
+            "Set up exact Python",
+            "Install pinned Hugging Face client without repository credentials",
+            "Classify publisher-environment failure before credential materialization",
+            "Publish exact bundle with only the Hugging Face credential",
+        ):
+            self.assertIn(
+                "publisher-rebind.outcome == 'success'",
+                deploy_steps[positions[step_name]].get("if", ""),
+            )
+        self.assertIn("publisher_executable_rebind", SCRIPT.read_text(encoding="utf-8"))
+
+    def test_rebind_failure_is_terminal_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt = root / "receipt.json"
+            failure = root / "workflow-failure.json"
+            result = MODULE.synthesize_workflow_outcome(
+                SOURCE_SHA,
+                root / "missing-result.json",
+                root / "missing-measurement.json",
+                root / "missing-mutation-failure.json",
+                root / "missing-partial.json",
+                receipt,
+                failure,
+                "skipped",
+                "skipped",
+                "skipped",
+                "skipped",
+                publisher_rebind_outcome="failure",
+            )
+            self.assertEqual(
+                result["failure_stage"], "publisher_executable_rebind"
+            )
+            self.assertFalse(receipt.exists())
+            self.assertEqual(failure.read_bytes(), MODULE.canonical_json(result))
 
     def test_deploy_uses_parent_lock_and_full_tree_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

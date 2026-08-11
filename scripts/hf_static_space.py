@@ -58,6 +58,14 @@ PUBLIC_REQUEST_TIMEOUT_CAP = 30.0
 DEPLOY_DEADLINE_SECONDS = 300.0
 MUTATION_READBACK_SECONDS = 90.0
 UA = "szl-hf-static-space/1.0"
+GITHUB_API_VERSION = "2026-03-10"
+GITHUB_PER_PAGE = 100
+GITHUB_MAX_PAGES = 100
+GOVERNED_MERGE_SCHEMA = "szl.github-governed-merge/v3"
+PR_BODY_MARKER_SCHEMA = "szl.pr-head/v1"
+PR_BODY_EVIDENCE_SCHEMA = "szl.pr-body-head/v1"
+PR_BODY_MARKER_PREFIX = "<!-- szl-release-evidence:"
+PR_BODY_MARKER_SUFFIX = " -->"
 DCO_TRAILER = re.compile(r"^Signed-off-by:\s*(.+?)\s*<([^<>\s]+)>$", re.IGNORECASE)
 SOURCE_RELATION = "source-bound-static-release"
 
@@ -413,7 +421,11 @@ def validate_bundle(bundle: Path, source_sha: str, config_path: Path = DEFAULT_C
 
 
 def _request_json(url: str, token: str = "") -> object:
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": UA}
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": UA,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
@@ -426,6 +438,144 @@ def _request_json(url: str, token: str = "") -> object:
         ) from error
 
 
+def _paged_url(url: str, page: int) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(
+            parsed.query, keep_blank_values=True
+        )
+        if key not in {"page", "per_page"}
+    ]
+    query.extend((("per_page", str(GITHUB_PER_PAGE)), ("page", str(page))))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), "")
+    )
+
+
+def _complete_list_inventory(url: str, token: str, label: str) -> list[dict]:
+    items: list[dict] = []
+    observed_ids: set[int] = set()
+    for page in range(1, GITHUB_MAX_PAGES + 1):
+        rows = _request_json(_paged_url(url, page), token)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ContractError(f"{label} page is unavailable or malformed")
+        if len(rows) > GITHUB_PER_PAGE:
+            raise ContractError(f"{label} page exceeds the requested bound")
+        for row in rows:
+            item_id = row.get("id")
+            if type(item_id) is not int or item_id <= 0 or item_id in observed_ids:
+                raise ContractError(f"{label} identity is malformed or duplicated")
+            observed_ids.add(item_id)
+            items.append(row)
+        if len(rows) < GITHUB_PER_PAGE:
+            return sorted(items, key=lambda row: row["id"])
+    raise ContractError(f"{label} exceeded the bounded pagination limit")
+
+
+def _complete_object_inventory(
+    url: str, token: str, key: str, label: str
+) -> list[dict]:
+    items: list[dict] = []
+    observed_ids: set[int] = set()
+    expected_total: int | None = None
+    for page in range(1, GITHUB_MAX_PAGES + 1):
+        response = _request_json(_paged_url(url, page), token)
+        if not isinstance(response, dict) or not isinstance(response.get(key), list):
+            raise ContractError(f"{label} inventory is unavailable")
+        total = response.get("total_count")
+        rows = response[key]
+        if type(total) is not int or total < 0:
+            raise ContractError(f"{label} total count is malformed")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise ContractError(f"{label} total count changed during pagination")
+        if len(rows) > GITHUB_PER_PAGE or any(not isinstance(row, dict) for row in rows):
+            raise ContractError(f"{label} page is incomplete or malformed")
+        for row in rows:
+            item_id = row.get("id")
+            if type(item_id) is not int or item_id <= 0 or item_id in observed_ids:
+                raise ContractError(f"{label} identity is malformed or duplicated")
+            observed_ids.add(item_id)
+            items.append(row)
+        if len(items) > expected_total:
+            raise ContractError(f"{label} inventory exceeds its total count")
+        if len(items) == expected_total:
+            return sorted(items, key=lambda row: row["id"])
+        if len(rows) < GITHUB_PER_PAGE:
+            raise ContractError(f"{label} inventory ended before its total count")
+    raise ContractError(f"{label} exceeded the bounded pagination limit")
+
+
+def exact_pr_body_evidence(body: object, repository: str, head_sha: str) -> dict:
+    head_sha = exact_sha(head_sha, "pull-request body head revision")
+    if not isinstance(body, str):
+        raise ContractError("pull-request body is unavailable")
+    marker_lines = [
+        line for line in body.splitlines() if "szl-release-evidence:" in line
+    ]
+    if len(marker_lines) != 1:
+        raise ContractError("pull-request body must contain one exact release marker")
+    marker = marker_lines[0]
+    if not marker.startswith(PR_BODY_MARKER_PREFIX) or not marker.endswith(
+        PR_BODY_MARKER_SUFFIX
+    ):
+        raise ContractError("pull-request release marker is malformed")
+    payload_text = marker[
+        len(PR_BODY_MARKER_PREFIX) : -len(PR_BODY_MARKER_SUFFIX)
+    ]
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as error:
+        raise ContractError("pull-request release marker JSON is malformed") from error
+    expected = {
+        "head_revision": head_sha,
+        "repository": repository,
+        "schema": PR_BODY_MARKER_SCHEMA,
+    }
+    canonical_payload = json.dumps(
+        expected, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if payload != expected or marker != (
+        PR_BODY_MARKER_PREFIX + canonical_payload + PR_BODY_MARKER_SUFFIX
+    ):
+        raise ContractError("pull-request release marker is not exact and canonical")
+    return {
+        "schema": PR_BODY_EVIDENCE_SCHEMA,
+        "repository": repository,
+        "head_revision": head_sha,
+        "body_sha256": sha256_bytes(body.encode("utf-8")),
+    }
+
+
+def validate_pr_body_event(
+    source_sha: str, event_path: Path, config_path: Path = DEFAULT_CONFIG
+) -> dict:
+    source_sha = exact_sha(source_sha)
+    config = load_config(config_path)
+    repository = config["source_repository"]
+    repository_id = TARGET_REPOSITORY_IDS[repository]
+    event = _load_event(event_path)
+    event_repository = event.get("repository")
+    pull = event.get("pull_request")
+    head = pull.get("head") if isinstance(pull, dict) else None
+    head_repository = head.get("repo") if isinstance(head, dict) else None
+    if (
+        not isinstance(event_repository, dict)
+        or event_repository.get("id") != repository_id
+        or event_repository.get("full_name") != repository
+        or not isinstance(pull, dict)
+        or not isinstance(head, dict)
+        or head.get("sha") != source_sha
+        or not isinstance(head_repository, dict)
+        or head_repository.get("id") != repository_id
+        or head_repository.get("full_name") != repository
+    ):
+        raise ContractError("pull-request event is not bound to this exact head")
+    return exact_pr_body_evidence(pull.get("body"), repository, source_sha)
+
+
 def _load_event(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -436,81 +586,80 @@ def _load_event(path: Path) -> dict:
     return value
 
 
-def _complete_inventory(rows: object, key: str, label: str) -> list[dict]:
-    if not isinstance(rows, dict) or not isinstance(rows.get(key), list):
-        raise ContractError(f"{label} inventory is unavailable")
-    items = rows[key]
-    total_count = rows.get("total_count")
-    if (
-        type(total_count) is not int
-        or total_count != len(items)
-        or total_count > 100
-        or any(not isinstance(item, dict) for item in items)
-    ):
-        raise ContractError(f"{label} inventory is incomplete or malformed")
-    return items
+def _check_run_id_from_url(value: object, api_root: str, repository: str) -> int:
+    prefix = f"{api_root}/repos/{repository}/check-runs/"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise ContractError("workflow job check-run URL is not exact")
+    suffix = value[len(prefix) :]
+    if not suffix.isdigit() or int(suffix) <= 0 or "/" in suffix:
+        raise ContractError("workflow job check-run identity is malformed")
+    return int(suffix)
 
 
-def _exact_job_url(value: object, repository: str, run_id: int, job_id: int) -> bool:
-    if not isinstance(value, str):
+def _run_pull_is_exact(
+    pull_requests: object,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+) -> bool:
+    if not isinstance(pull_requests, list) or len(pull_requests) != 1:
         return False
-    parsed = urllib.parse.urlsplit(value)
+    pull = pull_requests[0]
+    head = pull.get("head") if isinstance(pull, dict) else None
+    base = pull.get("base") if isinstance(pull, dict) else None
     return (
-        parsed.scheme == "https"
-        and parsed.netloc == "github.com"
-        and parsed.path
-        == f"/{repository}/actions/runs/{run_id}/job/{job_id}"
-        and not parsed.query
-        and not parsed.fragment
+        isinstance(pull, dict)
+        and pull.get("number") == pull_number
+        and isinstance(head, dict)
+        and head.get("ref") == head_ref
+        and head.get("sha") == head_sha
+        and isinstance(head.get("repo"), dict)
+        and head["repo"].get("id") == repository_id
+        and isinstance(base, dict)
+        and base.get("ref") == "main"
+        and base.get("sha") == base_sha
+        and isinstance(base.get("repo"), dict)
+        and base["repo"].get("id") == repository_id
     )
 
 
-def _require_successful_checks(
-    rows: object, repository: str, head_sha: str, release_run_id: int
-) -> list[dict]:
-    check_runs = _complete_inventory(rows, "check_runs", "exact-head check-run")
-    evidence: list[dict] = []
-    for name, integration_id in sorted(REQUIRED_STATUS_CONTEXTS.items()):
-        matches = [
-            row
-            for row in check_runs
-            if row.get("name") == name
-            and row.get("head_sha") == head_sha
-            and isinstance(row.get("app"), dict)
-            and row["app"].get("id") == integration_id
-            and type(row.get("id")) is int
-            and row["id"] > 0
-            and _exact_job_url(
-                row.get("details_url"), repository, release_run_id, row["id"]
-            )
-        ]
-        if not matches:
-            raise ContractError(
-                f"required exact publisher-workflow check is unavailable: {name}"
-            )
-        selected = max(matches, key=lambda row: row["id"])
-        if (
-            selected.get("status") != "completed"
-            or selected.get("conclusion") != "success"
-        ):
-            raise ContractError(
-                f"latest exact publisher-workflow check did not succeed: {name}"
-            )
-        evidence.append(
-            {
-                "app_id": integration_id,
-                "check_run_id": selected.get("id"),
-                "conclusion": "success",
-                "head_revision": head_sha,
-                "name": name,
-                "workflow_run_id": release_run_id,
-            }
+def _run_is_exact(
+    row: object,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+    workflow_id: int,
+    workflow_name: str,
+    workflow_path: str,
+) -> bool:
+    return (
+        isinstance(row, dict)
+        and row.get("workflow_id") == workflow_id
+        and row.get("name") == workflow_name
+        and row.get("path") == workflow_path
+        and row.get("event") == "pull_request"
+        and row.get("head_sha") == head_sha
+        and isinstance(row.get("repository"), dict)
+        and row["repository"].get("full_name") == repository
+        and row["repository"].get("id") == repository_id
+        and _run_pull_is_exact(
+            row.get("pull_requests"),
+            repository_id,
+            pull_number,
+            base_sha,
+            head_ref,
+            head_sha,
         )
-    return evidence
+    )
 
 
-def _require_exact_pull_request_workflow(
-    rows: object,
+def _select_exact_pull_request_workflow(
+    rows: list[dict],
     repository: str,
     repository_id: int,
     pull_number: int,
@@ -522,19 +671,22 @@ def _require_exact_pull_request_workflow(
     workflow_name: str,
     workflow_path: str,
     label: str,
-) -> dict[str, object]:
-    workflow_runs = _complete_inventory(rows, "workflow_runs", "workflow-run")
+) -> dict:
     matches = [
         row
-        for row in workflow_runs
-        if row.get("workflow_id") == workflow_id
-        and row.get("name") == workflow_name
-        and row.get("path") == workflow_path
-        and row.get("event") == "pull_request"
-        and row.get("head_sha") == head_sha
-        and isinstance(row.get("repository"), dict)
-        and row["repository"].get("full_name") == repository
-        and row["repository"].get("id") == repository_id
+        for row in rows
+        if _run_is_exact(
+            row,
+            repository,
+            repository_id,
+            pull_number,
+            base_sha,
+            head_ref,
+            head_sha,
+            workflow_id,
+            workflow_name,
+            workflow_path,
+        )
     ]
     if not matches:
         raise ContractError(f"exact {label} did not run for this head")
@@ -543,64 +695,216 @@ def _require_exact_pull_request_workflow(
         or row["id"] <= 0
         or type(row.get("run_attempt")) is not int
         or row["run_attempt"] <= 0
+        or type(row.get("check_suite_id")) is not int
+        or row["check_suite_id"] <= 0
         for row in matches
     ):
         raise ContractError(f"exact {label} identity is malformed")
-    selected = max(matches, key=lambda row: row["id"])
-    pull_requests = selected.get("pull_requests")
-    if not isinstance(pull_requests, list) or len(pull_requests) != 1:
-        raise ContractError(f"exact {label} is not bound to one pull request")
-    run_pull = pull_requests[0]
-    run_head = run_pull.get("head") if isinstance(run_pull, dict) else None
-    run_base = run_pull.get("base") if isinstance(run_pull, dict) else None
-    if (
-        not isinstance(run_pull, dict)
-        or run_pull.get("number") != pull_number
-        or not isinstance(run_head, dict)
-        or run_head.get("ref") != head_ref
-        or run_head.get("sha") != head_sha
-        or not isinstance(run_head.get("repo"), dict)
-        or run_head["repo"].get("id") != repository_id
-        or not isinstance(run_base, dict)
-        or run_base.get("ref") != "main"
-        or run_base.get("sha") != base_sha
-        or not isinstance(run_base.get("repo"), dict)
-        or run_base["repo"].get("id") != repository_id
-    ):
-        raise ContractError(f"exact {label} pull-request tuple is not exact")
+    selected = max(matches, key=lambda row: (row["id"], row["run_attempt"]))
     if (
         selected.get("status") != "completed"
         or selected.get("conclusion") != "success"
     ):
         raise ContractError(f"latest exact {label} did not succeed")
-    return {
-        "base_revision": base_sha,
-        "conclusion": "success",
-        "event": "pull_request",
-        "head_ref": head_ref,
-        "head_revision": head_sha,
-        "name": workflow_name,
-        "path": workflow_path,
-        "pull_request_number": pull_number,
-        "repository_id": repository_id,
-        "run_attempt": selected.get("run_attempt"),
-        "run_id": selected.get("id"),
-        "status": "completed",
-        "workflow_id": workflow_id,
-    }
+    return selected
 
 
-def _require_release_workflow(
-    rows: object,
+def _bind_workflow_attempt(
+    selected: dict,
+    api_root: str,
+    token: str,
     repository: str,
     repository_id: int,
     pull_number: int,
     base_sha: str,
     head_ref: str,
     head_sha: str,
-) -> dict[str, object]:
+    *,
+    workflow_id: int,
+    workflow_name: str,
+    workflow_path: str,
+    label: str,
+    required_job_names: frozenset[str],
+) -> tuple[dict[str, object], list[dict]]:
+    run_id = selected["id"]
+    run_attempt = selected["run_attempt"]
+    check_suite_id = selected["check_suite_id"]
+    run_url = f"{api_root}/repos/{repository}/actions/runs/{run_id}"
+    attempt = _request_json(f"{run_url}/attempts/{run_attempt}", token)
+    if (
+        not _run_is_exact(
+            attempt,
+            repository,
+            repository_id,
+            pull_number,
+            base_sha,
+            head_ref,
+            head_sha,
+            workflow_id,
+            workflow_name,
+            workflow_path,
+        )
+        or attempt.get("id") != run_id
+        or attempt.get("run_attempt") != run_attempt
+        or attempt.get("check_suite_id") != check_suite_id
+        or attempt.get("status") != "completed"
+        or attempt.get("conclusion") != "success"
+    ):
+        raise ContractError(f"exact {label} attempt readback is not exact")
+    jobs = _complete_object_inventory(
+        f"{run_url}/attempts/{run_attempt}/jobs",
+        token,
+        "jobs",
+        f"exact {label} attempt job",
+    )
+    if not jobs:
+        raise ContractError(f"exact {label} attempt has no jobs")
+    checks = _complete_object_inventory(
+        f"{api_root}/repos/{repository}/check-suites/{check_suite_id}/check-runs?filter=all",
+        token,
+        "check_runs",
+        f"exact {label} check-suite check-run",
+    )
+    checks_by_id = {row["id"]: row for row in checks}
+    job_evidence: list[dict] = []
+    for job in jobs:
+        job_id = job.get("id")
+        job_name = job.get("name")
+        check_run_id = _check_run_id_from_url(
+            job.get("check_run_url"), api_root, repository
+        )
+        check = checks_by_id.get(check_run_id)
+        if (
+            type(job_id) is not int
+            or job_id <= 0
+            or not isinstance(job_name, str)
+            or not job_name
+            or job.get("run_id") != run_id
+            or job.get("run_url") != run_url
+            or job.get("head_sha") != head_sha
+            or job.get("workflow_name") != workflow_name
+            or job.get("status") != "completed"
+            or job.get("conclusion") not in {"success", "skipped"}
+            or not isinstance(job.get("html_url"), str)
+            or not isinstance(check, dict)
+            or check.get("id") != check_run_id
+            or check.get("url") != job.get("check_run_url")
+            or check.get("name") != job_name
+            or check.get("head_sha") != head_sha
+            or check.get("status") != job.get("status")
+            or check.get("conclusion") != job.get("conclusion")
+            or check.get("details_url") != job.get("html_url")
+            or not isinstance(check.get("check_suite"), dict)
+            or check["check_suite"].get("id") != check_suite_id
+            or not isinstance(check.get("app"), dict)
+            or check["app"].get("id") != GITHUB_ACTIONS_INTEGRATION_ID
+        ):
+            raise ContractError(f"exact {label} job/check binding is not exact")
+        job_evidence.append(
+            {
+                "app_id": GITHUB_ACTIONS_INTEGRATION_ID,
+                "check_run_id": check_run_id,
+                "check_suite_id": check_suite_id,
+                "conclusion": job["conclusion"],
+                "head_revision": head_sha,
+                "job_id": job_id,
+                "name": job_name,
+                "run_attempt": run_attempt,
+                "run_id": run_id,
+                "status": "completed",
+            }
+        )
+    if not any(row["conclusion"] == "success" for row in job_evidence):
+        raise ContractError(f"exact {label} attempt has no successful job")
+    required: list[dict] = []
+    for name in sorted(required_job_names):
+        matches = [row for row in job_evidence if row["name"] == name]
+        if len(matches) != 1 or matches[0]["conclusion"] != "success":
+            raise ContractError(f"required exact {label} job did not succeed: {name}")
+        required.append(matches[0])
+    workflow_evidence = {
+        "base_revision": base_sha,
+        "check_suite_id": check_suite_id,
+        "conclusion": "success",
+        "event": "pull_request",
+        "head_ref": head_ref,
+        "head_revision": head_sha,
+        "jobs": sorted(job_evidence, key=lambda row: (row["name"], row["job_id"])),
+        "name": workflow_name,
+        "path": workflow_path,
+        "pull_request_number": pull_number,
+        "repository_id": repository_id,
+        "run_attempt": run_attempt,
+        "run_id": run_id,
+        "status": "completed",
+        "workflow_id": workflow_id,
+    }
+    return workflow_evidence, required
+
+
+def _require_exact_pull_request_workflow(
+    rows: list[dict],
+    api_root: str,
+    token: str,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+    *,
+    workflow_id: int,
+    workflow_name: str,
+    workflow_path: str,
+    label: str,
+    required_job_names: frozenset[str],
+) -> tuple[dict[str, object], list[dict]]:
+    selected = _select_exact_pull_request_workflow(
+        rows,
+        repository,
+        repository_id,
+        pull_number,
+        base_sha,
+        head_ref,
+        head_sha,
+        workflow_id=workflow_id,
+        workflow_name=workflow_name,
+        workflow_path=workflow_path,
+        label=label,
+    )
+    return _bind_workflow_attempt(
+        selected,
+        api_root,
+        token,
+        repository,
+        repository_id,
+        pull_number,
+        base_sha,
+        head_ref,
+        head_sha,
+        workflow_id=workflow_id,
+        workflow_name=workflow_name,
+        workflow_path=workflow_path,
+        label=label,
+        required_job_names=required_job_names,
+    )
+
+
+def _require_release_workflow(
+    rows: list[dict],
+    api_root: str,
+    token: str,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+) -> tuple[dict[str, object], list[dict]]:
     return _require_exact_pull_request_workflow(
         rows,
+        api_root,
+        token,
         repository,
         repository_id,
         pull_number,
@@ -611,20 +915,25 @@ def _require_release_workflow(
         workflow_name=RELEASE_WORKFLOW_NAME,
         workflow_path=RELEASE_WORKFLOW_PATH,
         label="publisher workflow",
+        required_job_names=frozenset(REQUIRED_STATUS_CONTEXTS),
     )
 
 
 def _require_boundary_workflow(
-    rows: object,
+    rows: list[dict],
+    api_root: str,
+    token: str,
     repository: str,
     repository_id: int,
     pull_number: int,
     base_sha: str,
     head_ref: str,
     head_sha: str,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], list[dict]]:
     return _require_exact_pull_request_workflow(
         rows,
+        api_root,
+        token,
         repository,
         repository_id,
         pull_number,
@@ -635,7 +944,98 @@ def _require_boundary_workflow(
         workflow_name=REQUIRED_WORKFLOW_NAME,
         workflow_path=REQUIRED_WORKFLOW_PATH,
         label="required release-boundary workflow",
+        required_job_names=frozenset(),
     )
+
+
+def _exact_merged_pull_projection(
+    pull: object,
+    candidate: dict,
+    repository: str,
+    repository_id: int,
+    before_sha: str,
+    source_sha: str,
+) -> dict:
+    if not isinstance(pull, dict) or pull.get("id") != candidate.get("id"):
+        raise ContractError("merged pull-request readback is not exact")
+    head = pull.get("head")
+    base = pull.get("base")
+    merged_by = pull.get("merged_by")
+    head_sha = exact_sha((head or {}).get("sha"), "pull-request head revision")
+    head_ref = (head or {}).get("ref")
+    if (
+        pull.get("number") != candidate.get("number")
+        or pull.get("state") != "closed"
+        or not pull.get("merged")
+        or not isinstance(pull.get("merged_at"), str)
+        or not pull["merged_at"]
+        or pull.get("merge_commit_sha") != source_sha
+        or not isinstance(base, dict)
+        or base.get("ref") != "main"
+        or base.get("sha") != before_sha
+        or not isinstance(base.get("repo"), dict)
+        or base["repo"].get("full_name") != repository
+        or base["repo"].get("id") != repository_id
+        or not isinstance(head, dict)
+        or not isinstance(head_ref, str)
+        or not head_ref
+        or not isinstance(head.get("repo"), dict)
+        or head["repo"].get("full_name") != repository
+        or head["repo"].get("id") != repository_id
+        or not isinstance(merged_by, dict)
+        or not isinstance(merged_by.get("login"), str)
+        or not merged_by["login"]
+    ):
+        raise ContractError("merged pull-request tuple is not exact")
+    return {
+        "base_revision": before_sha,
+        "body_evidence": exact_pr_body_evidence(
+            pull.get("body"), repository, head_sha
+        ),
+        "head_ref": head_ref,
+        "head_revision": head_sha,
+        "id": pull["id"],
+        "merge_revision": source_sha,
+        "merged_at": pull["merged_at"],
+        "merged_by": merged_by["login"],
+        "number": pull["number"],
+    }
+
+
+def _require_latest_run_still_exact(
+    api_root: str,
+    token: str,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+    evidence: dict,
+) -> None:
+    current = _request_json(
+        f"{api_root}/repos/{repository}/actions/runs/{evidence['run_id']}", token
+    )
+    if (
+        not _run_is_exact(
+            current,
+            repository,
+            repository_id,
+            pull_number,
+            base_sha,
+            head_ref,
+            head_sha,
+            evidence["workflow_id"],
+            evidence["name"],
+            evidence["path"],
+        )
+        or current.get("id") != evidence["run_id"]
+        or current.get("run_attempt") != evidence["run_attempt"]
+        or current.get("check_suite_id") != evidence["check_suite_id"]
+        or current.get("status") != "completed"
+        or current.get("conclusion") != "success"
+    ):
+        raise ContractError("workflow run advanced after exact-attempt authorization")
 
 
 def require_governed_main(
@@ -689,11 +1089,12 @@ def require_governed_main(
             raise ContractError(
                 f"refusing stale release: current main {live_sha!r} != source {source_sha!r}"
             )
-        associated = _request_json(
-            f"{api_root}/repos/{repository}/commits/{source_sha}/pulls", token
+        associated_url = (
+            f"{api_root}/repos/{repository}/commits/{source_sha}/pulls"
         )
-        if not isinstance(associated, list):
-            raise ContractError("associated pull-request evidence is unavailable")
+        associated = _complete_list_inventory(
+            associated_url, token, "associated pull-request"
+        )
         candidates = [
             row
             for row in associated
@@ -714,67 +1115,124 @@ def require_governed_main(
         if type(number) is not int or number <= 0:
             raise ContractError("associated pull-request number is malformed")
         pull = _request_json(f"{api_root}/repos/{repository}/pulls/{number}", token)
-        if not isinstance(pull, dict) or pull.get("id") != candidate.get("id"):
-            raise ContractError("merged pull-request readback is not exact")
-        head = pull.get("head")
-        base = pull.get("base")
-        merged_by = pull.get("merged_by")
-        head_sha = exact_sha((head or {}).get("sha"), "pull-request head revision")
-        head_ref = (head or {}).get("ref")
-        if (
-            pull.get("state") != "closed"
-            or not pull.get("merged")
-            or not pull.get("merged_at")
-            or pull.get("merge_commit_sha") != source_sha
-            or not isinstance(base, dict)
-            or base.get("ref") != "main"
-            or base.get("sha") != before_sha
-            or not isinstance(base.get("repo"), dict)
-            or base["repo"].get("full_name") != repository
-            or not isinstance(head, dict)
-            or not isinstance(head_ref, str)
-            or not head_ref
-            or not isinstance(head.get("repo"), dict)
-            or head["repo"].get("full_name") != repository
-            or head["repo"].get("id") != expected_repository_id
-            or base["repo"].get("id") != expected_repository_id
-            or not isinstance(merged_by, dict)
-            or not isinstance(merged_by.get("login"), str)
-        ):
-            raise ContractError("merged pull-request tuple is not exact")
+        pull_evidence = _exact_merged_pull_projection(
+            pull,
+            candidate,
+            repository,
+            expected_repository_id,
+            before_sha,
+            source_sha,
+        )
+        head_sha = pull_evidence["head_revision"]
+        head_ref = pull_evidence["head_ref"]
         query = urllib.parse.urlencode(
-            {"event": "pull_request", "head_sha": head_sha, "per_page": 100}
+            {"event": "pull_request", "head_sha": head_sha}
         )
-        workflow_runs = _request_json(
-            f"{api_root}/repos/{repository}/actions/runs?{query}", token
+        workflow_runs_url = f"{api_root}/repos/{repository}/actions/runs?{query}"
+        workflow_runs = _complete_object_inventory(
+            workflow_runs_url, token, "workflow_runs", "exact-head workflow-run"
         )
-        release_workflow = _require_release_workflow(
+        release_workflow, checks = _require_release_workflow(
             workflow_runs,
-            repository,
-            expected_repository_id,
-            number,
-            before_sha,
-            head_ref,
-            head_sha,
-        )
-        boundary = _require_boundary_workflow(
-            workflow_runs,
-            repository,
-            expected_repository_id,
-            number,
-            before_sha,
-            head_ref,
-            head_sha,
-        )
-        check_runs = _request_json(
-            f"{api_root}/repos/{repository}/commits/{head_sha}/check-runs?per_page=100",
+            api_root,
             token,
+            repository,
+            expected_repository_id,
+            number,
+            before_sha,
+            head_ref,
+            head_sha,
         )
-        checks = _require_successful_checks(
-            check_runs, repository, head_sha, int(release_workflow["run_id"])
+        boundary, _ = _require_boundary_workflow(
+            workflow_runs,
+            api_root,
+            token,
+            repository,
+            expected_repository_id,
+            number,
+            before_sha,
+            head_ref,
+            head_sha,
         )
+        final_workflow_runs = _complete_object_inventory(
+            workflow_runs_url, token, "workflow_runs", "final exact-head workflow-run"
+        )
+        for workflow, workflow_id, workflow_name, workflow_path, label in (
+            (
+                release_workflow,
+                TARGET_RELEASE_WORKFLOW_IDS[repository],
+                RELEASE_WORKFLOW_NAME,
+                RELEASE_WORKFLOW_PATH,
+                "publisher workflow",
+            ),
+            (
+                boundary,
+                TARGET_REQUIRED_WORKFLOW_IDS[repository],
+                REQUIRED_WORKFLOW_NAME,
+                REQUIRED_WORKFLOW_PATH,
+                "required release-boundary workflow",
+            ),
+        ):
+            selected = _select_exact_pull_request_workflow(
+                final_workflow_runs,
+                repository,
+                expected_repository_id,
+                number,
+                before_sha,
+                head_ref,
+                head_sha,
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                workflow_path=workflow_path,
+                label=label,
+            )
+            if (
+                selected.get("id") != workflow["run_id"]
+                or selected.get("run_attempt") != workflow["run_attempt"]
+                or selected.get("check_suite_id") != workflow["check_suite_id"]
+            ):
+                raise ContractError(f"exact {label} advanced during authorization")
+            _require_latest_run_still_exact(
+                api_root,
+                token,
+                repository,
+                expected_repository_id,
+                number,
+                before_sha,
+                head_ref,
+                head_sha,
+                workflow,
+            )
+        final_pull = _request_json(
+            f"{api_root}/repos/{repository}/pulls/{number}", token
+        )
+        final_pull_evidence = _exact_merged_pull_projection(
+            final_pull,
+            candidate,
+            repository,
+            expected_repository_id,
+            before_sha,
+            source_sha,
+        )
+        if canonical_json(final_pull_evidence) != canonical_json(pull_evidence):
+            raise ContractError("merged pull-request evidence changed during authorization")
+        final_associated = _complete_list_inventory(
+            associated_url, token, "final associated pull-request"
+        )
+        if canonical_json(final_associated) != canonical_json(associated):
+            raise ContractError(
+                "associated pull-request inventory changed during authorization"
+            )
+        final_branch = _request_json(
+            f"{api_root}/repos/{repository}/branches/main", token
+        )
+        final_main_sha = str(
+            ((final_branch or {}).get("commit") or {}).get("sha") or ""
+        ).lower()
+        if final_main_sha != source_sha:
+            raise ContractError("protected main changed during authorization")
         evidence = {
-            "schema": "szl.github-governed-merge/v2",
+            "schema": GOVERNED_MERGE_SCHEMA,
             "status": "AUTHORIZED_EXACT_GOVERNED_MERGE",
             "source_revision": source_sha,
             "repository": {
@@ -783,15 +1241,7 @@ def require_governed_main(
                 "id": expected_repository_id,
             },
             "push": {"before": before_sha, "after": source_sha},
-            "pull_request": {
-                "base_revision": before_sha,
-                "head_ref": head_ref,
-                "head_revision": head_sha,
-                "merge_revision": source_sha,
-                "merged_at": pull["merged_at"],
-                "merged_by": merged_by["login"],
-                "number": number,
-            },
+            "pull_request": pull_evidence,
             "required_checks": checks,
             "release_workflow": release_workflow,
             "required_workflow": boundary,
@@ -818,6 +1268,44 @@ def require_governed_main(
         raise
 
 
+def _job_evidence_is_exact(
+    job: object,
+    run_id: int,
+    run_attempt: int,
+    check_suite_id: int,
+    head_sha: str,
+) -> bool:
+    return (
+        isinstance(job, dict)
+        and set(job)
+        == {
+            "app_id",
+            "check_run_id",
+            "check_suite_id",
+            "conclusion",
+            "head_revision",
+            "job_id",
+            "name",
+            "run_attempt",
+            "run_id",
+            "status",
+        }
+        and job.get("app_id") == GITHUB_ACTIONS_INTEGRATION_ID
+        and type(job.get("check_run_id")) is int
+        and job["check_run_id"] > 0
+        and job.get("check_suite_id") == check_suite_id
+        and job.get("conclusion") in {"success", "skipped"}
+        and job.get("head_revision") == head_sha
+        and type(job.get("job_id")) is int
+        and job["job_id"] > 0
+        and isinstance(job.get("name"), str)
+        and bool(job["name"])
+        and job.get("run_attempt") == run_attempt
+        and job.get("run_id") == run_id
+        and job.get("status") == "completed"
+    )
+
+
 def _workflow_evidence_is_exact(
     workflow: object,
     *,
@@ -829,40 +1317,69 @@ def _workflow_evidence_is_exact(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    required_job_names: frozenset[str],
 ) -> bool:
-    return (
-        isinstance(workflow, dict)
-        and set(workflow)
-        == {
-            "base_revision",
-            "conclusion",
-            "event",
-            "head_ref",
-            "head_revision",
-            "name",
-            "path",
-            "pull_request_number",
-            "repository_id",
-            "run_attempt",
-            "run_id",
-            "status",
-            "workflow_id",
-        }
-        and workflow.get("workflow_id") == workflow_id
-        and workflow.get("name") == workflow_name
-        and workflow.get("path") == workflow_path
-        and workflow.get("event") == "pull_request"
-        and workflow.get("repository_id") == repository_id
-        and workflow.get("pull_request_number") == pull_number
-        and workflow.get("base_revision") == base_sha
-        and workflow.get("head_ref") == head_ref
-        and workflow.get("head_revision") == head_sha
-        and workflow.get("status") == "completed"
-        and workflow.get("conclusion") == "success"
-        and type(workflow.get("run_id")) is int
-        and workflow["run_id"] > 0
-        and type(workflow.get("run_attempt")) is int
-        and workflow["run_attempt"] > 0
+    if not isinstance(workflow, dict) or set(workflow) != {
+        "base_revision",
+        "check_suite_id",
+        "conclusion",
+        "event",
+        "head_ref",
+        "head_revision",
+        "jobs",
+        "name",
+        "path",
+        "pull_request_number",
+        "repository_id",
+        "run_attempt",
+        "run_id",
+        "status",
+        "workflow_id",
+    }:
+        return False
+    run_id = workflow.get("run_id")
+    run_attempt = workflow.get("run_attempt")
+    check_suite_id = workflow.get("check_suite_id")
+    jobs = workflow.get("jobs")
+    if (
+        workflow.get("workflow_id") != workflow_id
+        or workflow.get("name") != workflow_name
+        or workflow.get("path") != workflow_path
+        or workflow.get("event") != "pull_request"
+        or workflow.get("repository_id") != repository_id
+        or workflow.get("pull_request_number") != pull_number
+        or workflow.get("base_revision") != base_sha
+        or workflow.get("head_ref") != head_ref
+        or workflow.get("head_revision") != head_sha
+        or workflow.get("status") != "completed"
+        or workflow.get("conclusion") != "success"
+        or type(run_id) is not int
+        or run_id <= 0
+        or type(run_attempt) is not int
+        or run_attempt <= 0
+        or type(check_suite_id) is not int
+        or check_suite_id <= 0
+        or not isinstance(jobs, list)
+        or not jobs
+        or not all(
+            _job_evidence_is_exact(
+                job, run_id, run_attempt, check_suite_id, head_sha
+            )
+            for job in jobs
+        )
+    ):
+        return False
+    if len({job["job_id"] for job in jobs}) != len(jobs) or len(
+        {job["check_run_id"] for job in jobs}
+    ) != len(jobs):
+        return False
+    if not any(job["conclusion"] == "success" for job in jobs):
+        return False
+    return all(
+        len([job for job in jobs if job["name"] == name]) == 1
+        and next(job for job in jobs if job["name"] == name)["conclusion"]
+        == "success"
+        for name in required_job_names
     )
 
 
@@ -878,47 +1395,16 @@ def load_governed_merge(
         raise ContractError("governed-merge evidence is unreadable") from error
     if not isinstance(evidence, dict) or raw != canonical_json(evidence):
         raise ContractError("governed-merge evidence is not canonical")
+    expected_repository = config["source_repository"]
     repository = evidence.get("repository")
     push = evidence.get("push")
     pull = evidence.get("pull_request")
     checks = evidence.get("required_checks")
     release_workflow = evidence.get("release_workflow")
-    workflow = evidence.get("required_workflow")
-    expected_repository = config["source_repository"]
-    expected_checks = {
-        (name, integration_id)
-        for name, integration_id in REQUIRED_STATUS_CONTEXTS.items()
-    }
-    checks_are_exact = isinstance(checks, list) and all(
-        isinstance(row, dict)
-        and set(row)
-        == {
-            "app_id",
-            "check_run_id",
-            "conclusion",
-            "head_revision",
-            "name",
-            "workflow_run_id",
-        }
-        for row in checks
-    )
-    observed_checks = {
-        (row.get("name"), row.get("app_id"))
-        for row in checks
-        if isinstance(row, dict)
-        and row.get("head_revision") == (pull or {}).get("head_revision")
-        and row.get("conclusion") == "success"
-        and type(row.get("check_run_id")) is int
-        and row.get("check_run_id") > 0
-        and row.get("workflow_run_id") == (release_workflow or {}).get("run_id")
-    } if isinstance(checks, list) else set()
-    pull_number = (pull or {}).get("number")
-    pull_base = (pull or {}).get("base_revision")
-    pull_head_ref = (pull or {}).get("head_ref")
-    pull_head = (pull or {}).get("head_revision")
-    repository_id = (repository or {}).get("id")
+    boundary_workflow = evidence.get("required_workflow")
     if (
-        set(evidence) != {
+        set(evidence)
+        != {
             "schema",
             "status",
             "source_revision",
@@ -929,7 +1415,7 @@ def load_governed_merge(
             "release_workflow",
             "required_workflow",
         }
-        or evidence.get("schema") != "szl.github-governed-merge/v2"
+        or evidence.get("schema") != GOVERNED_MERGE_SCHEMA
         or evidence.get("status") != "AUTHORIZED_EXACT_GOVERNED_MERGE"
         or evidence.get("source_revision") != source_sha
         or not isinstance(repository, dict)
@@ -942,21 +1428,29 @@ def load_governed_merge(
         or push.get("after") != source_sha
         or not isinstance(push.get("before"), str)
         or not HEX40.fullmatch(push["before"])
-        or not isinstance(pull, dict)
-        or set(pull) != {
-            "base_revision",
-            "head_ref",
-            "head_revision",
-            "merge_revision",
-            "merged_at",
-            "merged_by",
-            "number",
-        }
-        or pull.get("base_revision") != push.get("before")
+    ):
+        raise ContractError("governed-merge evidence is not bound to this release")
+    if not isinstance(pull, dict) or set(pull) != {
+        "base_revision",
+        "body_evidence",
+        "head_ref",
+        "head_revision",
+        "id",
+        "merge_revision",
+        "merged_at",
+        "merged_by",
+        "number",
+    }:
+        raise ContractError("governed-merge pull-request evidence is malformed")
+    body_evidence = pull.get("body_evidence")
+    if (
+        pull.get("base_revision") != push.get("before")
         or not isinstance(pull.get("head_ref"), str)
         or not pull["head_ref"]
         or not isinstance(pull.get("head_revision"), str)
         or not HEX40.fullmatch(pull["head_revision"])
+        or type(pull.get("id")) is not int
+        or pull["id"] <= 0
         or pull.get("merge_revision") != source_sha
         or not isinstance(pull.get("merged_at"), str)
         or not pull["merged_at"]
@@ -964,34 +1458,49 @@ def load_governed_merge(
         or not pull["merged_by"]
         or type(pull.get("number")) is not int
         or pull["number"] <= 0
-        or not isinstance(checks, list)
-        or len(checks) != len(expected_checks)
-        or not checks_are_exact
-        or observed_checks != expected_checks
-        or not _workflow_evidence_is_exact(
-            release_workflow,
-            workflow_id=TARGET_RELEASE_WORKFLOW_IDS[expected_repository],
-            workflow_name=RELEASE_WORKFLOW_NAME,
-            workflow_path=RELEASE_WORKFLOW_PATH,
-            repository_id=repository_id,
-            pull_number=pull_number,
-            base_sha=pull_base,
-            head_ref=pull_head_ref,
-            head_sha=pull_head,
-        )
-        or not _workflow_evidence_is_exact(
-            workflow,
-            workflow_id=TARGET_REQUIRED_WORKFLOW_IDS[expected_repository],
-            workflow_name=REQUIRED_WORKFLOW_NAME,
-            workflow_path=REQUIRED_WORKFLOW_PATH,
-            repository_id=repository_id,
-            pull_number=pull_number,
-            base_sha=pull_base,
-            head_ref=pull_head_ref,
-            head_sha=pull_head,
-        )
+        or not isinstance(body_evidence, dict)
+        or set(body_evidence)
+        != {"body_sha256", "head_revision", "repository", "schema"}
+        or body_evidence.get("schema") != PR_BODY_EVIDENCE_SCHEMA
+        or body_evidence.get("repository") != expected_repository
+        or body_evidence.get("head_revision") != pull.get("head_revision")
+        or not isinstance(body_evidence.get("body_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body_evidence["body_sha256"]) is None
     ):
-        raise ContractError("governed-merge evidence is not bound to this release")
+        raise ContractError("governed-merge pull-request evidence is not exact")
+    common = {
+        "repository_id": repository["id"],
+        "pull_number": pull["number"],
+        "base_sha": pull["base_revision"],
+        "head_ref": pull["head_ref"],
+        "head_sha": pull["head_revision"],
+    }
+    if not _workflow_evidence_is_exact(
+        release_workflow,
+        workflow_id=TARGET_RELEASE_WORKFLOW_IDS[expected_repository],
+        workflow_name=RELEASE_WORKFLOW_NAME,
+        workflow_path=RELEASE_WORKFLOW_PATH,
+        required_job_names=frozenset(REQUIRED_STATUS_CONTEXTS),
+        **common,
+    ) or not _workflow_evidence_is_exact(
+        boundary_workflow,
+        workflow_id=TARGET_REQUIRED_WORKFLOW_IDS[expected_repository],
+        workflow_name=REQUIRED_WORKFLOW_NAME,
+        workflow_path=REQUIRED_WORKFLOW_PATH,
+        required_job_names=frozenset(),
+        **common,
+    ):
+        raise ContractError("governed-merge workflow evidence is not exact")
+    expected_checks = sorted(
+        [
+            job
+            for job in release_workflow["jobs"]
+            if job["name"] in REQUIRED_STATUS_CONTEXTS
+        ],
+        key=lambda row: row["name"],
+    )
+    if checks != expected_checks:
+        raise ContractError("governed-merge required-check evidence is not exact")
     return evidence
 
 
@@ -1566,6 +2075,7 @@ def write_workflow_stage_failure(
     permitted = {
         "governance_authorization",
         "publisher_input",
+        "publisher_executable_rebind",
         "publisher_environment",
         "publisher_mutation",
         "publisher_evidence_upload",
@@ -1612,6 +2122,7 @@ def synthesize_workflow_outcome(
     authorization_outcome: str = "success",
     authorization_evidence_outcome: str = "success",
     publisher_input_outcome: str = "success",
+    publisher_rebind_outcome: str = "success",
     publisher_environment_outcome: str = "success",
     publisher_evidence_outcome: str = "success",
     publisher_evidence_download_outcome: str = "success",
@@ -1641,6 +2152,7 @@ def synthesize_workflow_outcome(
         "governance_authorization": authorization_outcome,
         "governance_authorization_evidence": authorization_evidence_outcome,
         "publisher_input": publisher_input_outcome,
+        "publisher_executable_rebind": publisher_rebind_outcome,
         "publisher_environment": publisher_environment_outcome,
         "publisher_mutation": publish_outcome,
         "publisher_evidence_upload": publisher_evidence_outcome,
@@ -1737,6 +2249,9 @@ def main() -> int:
     guard.add_argument("--event", type=Path, required=True)
     guard.add_argument("--output", type=Path, required=True)
     guard.add_argument("--failure-output", type=Path, required=True)
+    pr_body = subparsers.add_parser("pr-body")
+    pr_body.add_argument("--source-sha", required=True)
+    pr_body.add_argument("--event", type=Path, required=True)
     dco = subparsers.add_parser("dco")
     dco.add_argument("--base-sha", required=True)
     dco.add_argument("--head-sha", required=True)
@@ -1775,6 +2290,7 @@ def main() -> int:
     outcome.add_argument("--authorization-outcome", default="success")
     outcome.add_argument("--authorization-evidence-outcome", default="success")
     outcome.add_argument("--publisher-input-outcome", default="success")
+    outcome.add_argument("--publisher-rebind-outcome", default="success")
     outcome.add_argument("--publisher-environment-outcome", default="success")
     outcome.add_argument("--publisher-evidence-outcome", default="success")
     outcome.add_argument("--publisher-evidence-download-outcome", default="success")
@@ -1795,6 +2311,8 @@ def main() -> int:
             args.config,
             failure_output_path=args.failure_output,
         )
+    elif args.command == "pr-body":
+        value = validate_pr_body_event(args.source_sha, args.event, args.config)
     elif args.command == "dco":
         value = validate_dco_range(args.base_sha, args.head_sha)
     elif args.command == "deploy":
@@ -1843,6 +2361,7 @@ def main() -> int:
             authorization_outcome=args.authorization_outcome,
             authorization_evidence_outcome=args.authorization_evidence_outcome,
             publisher_input_outcome=args.publisher_input_outcome,
+            publisher_rebind_outcome=args.publisher_rebind_outcome,
             publisher_environment_outcome=args.publisher_environment_outcome,
             publisher_evidence_outcome=args.publisher_evidence_outcome,
             publisher_evidence_download_outcome=args.publisher_evidence_download_outcome,

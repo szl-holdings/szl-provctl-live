@@ -2,6 +2,7 @@ name: Governed static Space release
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   push:
     branches: [main]
 
@@ -56,6 +57,15 @@ jobs:
           "$VALIDATOR_PYTHON" -I scripts/hf_static_space.py validate \
             --source-sha "$SOURCE_SHA" \
             --bundle "$RUNNER_TEMP/hf-static-space"
+      - name: Validate exact-head pull-request body evidence
+        if: github.event_name == 'pull_request'
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python -I scripts/hf_static_space.py pr-body \
+            --source-sha "$SOURCE_SHA" \
+            --event "$GITHUB_EVENT_PATH"
 
   dco:
     name: DCO
@@ -103,7 +113,13 @@ jobs:
       authorization-evidence-outcome: ${{ steps.authorization-evidence.outcome }}
       bundle-outcome: ${{ steps.bundle.outcome }}
       publisher-input-outcome: ${{ steps.publisher-input.outcome }}
+      publisher-digests-outcome: ${{ steps.publisher-digests.outcome }}
       publisher-input-evidence-outcome: ${{ steps.publisher-input-evidence.outcome }}
+      publisher_script_sha256: ${{ steps.publisher-digests.outputs.publisher_script_sha256 }}
+      publisher_lock_sha256: ${{ steps.publisher-digests.outputs.publisher_lock_sha256 }}
+      publisher_config_sha256: ${{ steps.publisher-digests.outputs.publisher_config_sha256 }}
+      authorization_sha256: ${{ steps.publisher-digests.outputs.authorization_sha256 }}
+      bundle_manifest_sha256: ${{ steps.publisher-digests.outputs.bundle_manifest_sha256 }}
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -160,9 +176,34 @@ jobs:
           install -m 0644 requirements/hf-publisher.lock "$INPUT/requirements/hf-publisher.lock"
           install -m 0644 "$RUNNER_TEMP/governed-merge.json" "$INPUT/governed-merge.json"
           cp -R "$RUNNER_TEMP/hf-static-space" "$INPUT/hf-static-space"
+      - name: Bind five exact publisher inputs outside the artifact channel
+        id: publisher-digests
+        if: steps.publisher-input.outcome == 'success'
+        continue-on-error: true
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          emit_digest() {
+            local name="$1"
+            local path="$2"
+            test -f "$path"
+            test ! -L "$path"
+            local digest
+            digest="$(sha256sum "$path")"
+            digest="${digest%% *}"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            printf '%s=%s\n' "$name" "$digest" >> "$GITHUB_OUTPUT"
+          }
+          emit_digest publisher_script_sha256 scripts/hf_static_space.py
+          emit_digest publisher_lock_sha256 requirements/hf-publisher.lock
+          emit_digest publisher_config_sha256 .hf-space.json
+          emit_digest authorization_sha256 "$RUNNER_TEMP/governed-merge.json"
+          emit_digest bundle_manifest_sha256 "$RUNNER_TEMP/hf-static-space/hf-deploy-manifest.json"
       - name: Upload exact publisher input
         id: publisher-input-evidence
-        if: steps.publisher-input.outcome == 'success'
+        if: steps.publisher-input.outcome == 'success' && steps.publisher-digests.outcome == 'success'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -190,12 +231,13 @@ jobs:
           test "${{ steps.authorization.outcome }}" = "success"
           test "${{ steps.bundle.outcome }}" = "success"
           test "${{ steps.publisher-input.outcome }}" = "success"
+          test "${{ steps.publisher-digests.outcome }}" = "success"
           test "${{ steps.publisher-input-evidence.outcome }}" = "success"
           test "${{ steps.authorization-evidence.outcome }}" = "success"
 
   deploy:
     name: publish-exact-protected-main
-    if: always() && needs.authorize.result == 'success' && needs.authorize.outputs.authorization-outcome == 'success' && needs.authorize.outputs.authorization-evidence-outcome == 'success' && needs.authorize.outputs.publisher-input-evidence-outcome == 'success'
+    if: always() && needs.authorize.result == 'success' && needs.authorize.outputs.authorization-outcome == 'success' && needs.authorize.outputs.authorization-evidence-outcome == 'success' && needs.authorize.outputs.publisher-digests-outcome == 'success' && needs.authorize.outputs.publisher-input-evidence-outcome == 'success'
     needs: [authorize]
     permissions: {}
     runs-on: ubuntu-latest
@@ -205,6 +247,7 @@ jobs:
       SOURCE_SHA: ${{ github.sha }}
     outputs:
       publisher-input-outcome: ${{ steps.publisher-input.outcome }}
+      publisher-rebind-outcome: ${{ steps.publisher-rebind.outcome }}
       publisher-environment-outcome: ${{ steps.publisher-environment.outcome }}
       publish-outcome: ${{ steps.publish.outcome }}
       publisher-evidence-outcome: ${{ steps.publisher-evidence.outcome }}
@@ -220,14 +263,45 @@ jobs:
         with:
           name: hf-static-space-publisher-input-${{ github.sha }}
           path: ${{ runner.temp }}/publisher-input
-      - name: Set up exact Python
+      - name: Rebind five publisher inputs before interpretation or credentials
+        id: publisher-rebind
         if: steps.publisher-input.outcome == 'success'
+        continue-on-error: true
+        env:
+          EXPECTED_PUBLISHER_SCRIPT_SHA256: ${{ needs.authorize.outputs.publisher_script_sha256 }}
+          EXPECTED_PUBLISHER_LOCK_SHA256: ${{ needs.authorize.outputs.publisher_lock_sha256 }}
+          EXPECTED_PUBLISHER_CONFIG_SHA256: ${{ needs.authorize.outputs.publisher_config_sha256 }}
+          EXPECTED_AUTHORIZATION_SHA256: ${{ needs.authorize.outputs.authorization_sha256 }}
+          EXPECTED_BUNDLE_MANIFEST_SHA256: ${{ needs.authorize.outputs.bundle_manifest_sha256 }}
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+        run: |
+          set -euo pipefail
+          INPUT="$RUNNER_TEMP/publisher-input"
+          require_digest() {
+            local expected="$1"
+            local path="$2"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            test -f "$path"
+            test ! -L "$path"
+            local actual
+            actual="$(sha256sum "$path")"
+            actual="${actual%% *}"
+            test "$actual" = "$expected"
+          }
+          require_digest "$EXPECTED_PUBLISHER_SCRIPT_SHA256" "$INPUT/scripts/hf_static_space.py"
+          require_digest "$EXPECTED_PUBLISHER_LOCK_SHA256" "$INPUT/requirements/hf-publisher.lock"
+          require_digest "$EXPECTED_PUBLISHER_CONFIG_SHA256" "$INPUT/.hf-space.json"
+          require_digest "$EXPECTED_AUTHORIZATION_SHA256" "$INPUT/governed-merge.json"
+          require_digest "$EXPECTED_BUNDLE_MANIFEST_SHA256" "$INPUT/hf-static-space/hf-deploy-manifest.json"
+      - name: Set up exact Python
+        if: steps.publisher-rebind.outcome == 'success'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12.13"
       - name: Install pinned Hugging Face client without repository credentials
         id: publisher-environment
-        if: steps.publisher-input.outcome == 'success'
+        if: steps.publisher-rebind.outcome == 'success'
         continue-on-error: true
         env:
           PUBLISHER_VENV: ${{ runner.temp }}/hf-publisher-venv
@@ -245,7 +319,7 @@ jobs:
             'import importlib.metadata as m, huggingface_hub as h; assert m.version("huggingface-hub") == "1.19.0" == h.__version__'
           echo "PUBLISHER_PYTHON=$PUBLISHER_PYTHON" >> "$GITHUB_ENV"
       - name: Classify publisher-environment failure before credential materialization
-        if: always() && steps.publisher-input.outcome == 'success' && steps.publisher-environment.outcome != 'success'
+        if: always() && steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome != 'success'
         run: |
           set -euo pipefail
           python -I "$RUNNER_TEMP/publisher-input/scripts/hf_static_space.py" stage-failure \
@@ -254,7 +328,7 @@ jobs:
             --output "$RUNNER_TEMP/publication-evidence/hf-workflow-stage-failure.json"
       - name: Publish exact bundle with only the Hugging Face credential
         id: publish
-        if: steps.publisher-environment.outcome == 'success'
+        if: steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome == 'success'
         continue-on-error: true
         env:
           GITHUB_TOKEN: ""
@@ -283,6 +357,7 @@ jobs:
         run: |
           set -euo pipefail
           test "${{ steps.publisher-input.outcome }}" = "success"
+          test "${{ steps.publisher-rebind.outcome }}" = "success"
           test "${{ steps.publisher-environment.outcome }}" = "success"
           test "${{ steps.publish.outcome }}" = "success"
           test "${{ steps.publisher-evidence.outcome }}" = "success"
@@ -424,6 +499,7 @@ jobs:
             --authorization-outcome "${{ needs.authorize.outputs.authorization-outcome }}" \
             --authorization-evidence-outcome "${{ needs.authorize.outputs.authorization-evidence-outcome }}" \
             --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
+            --publisher-rebind-outcome "${{ needs.deploy.outputs.publisher-rebind-outcome }}" \
             --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
             --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
             --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
@@ -466,6 +542,7 @@ jobs:
             --authorization-outcome "${{ needs.authorize.outputs.authorization-outcome }}" \
             --authorization-evidence-outcome "${{ needs.authorize.outputs.authorization-evidence-outcome }}" \
             --publisher-input-outcome "${{ needs.deploy.outputs.publisher-input-outcome }}" \
+            --publisher-rebind-outcome "${{ needs.deploy.outputs.publisher-rebind-outcome }}" \
             --publisher-environment-outcome "${{ needs.deploy.outputs.publisher-environment-outcome }}" \
             --publish-outcome "${{ needs.deploy.outputs.publish-outcome }}" \
             --publisher-evidence-outcome "${{ needs.deploy.outputs.publisher-evidence-outcome }}" \
@@ -491,6 +568,7 @@ jobs:
           test "${{ needs.authorize.outputs.authorization-outcome }}" = "success"
           test "${{ needs.authorize.outputs.authorization-evidence-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-input-outcome }}" = "success"
+          test "${{ needs.deploy.outputs.publisher-rebind-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-environment-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publish-outcome }}" = "success"
           test "${{ needs.deploy.outputs.publisher-evidence-outcome }}" = "success"
