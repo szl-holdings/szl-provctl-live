@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 import urllib.error
 import urllib.parse
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,110 +25,437 @@ SPEC.loader.exec_module(MODULE)
 SOURCE_SHA = "a" * 40
 PARENT_SHA = "b" * 40
 TARGET_SHA = "c" * 40
+PR_HEAD_SHA = "d" * 40
+RELEASE_RUN_ID = 98
+BOUNDARY_RUN_ID = 99
+RELEASE_CHECK_SUITE_ID = 198
+BOUNDARY_CHECK_SUITE_ID = 199
 
 
-def strong_ruleset() -> dict:
+def exact_pr_body(repository: str, head_sha: str = PR_HEAD_SHA) -> str:
+    payload = {
+        "head_revision": head_sha,
+        "repository": repository,
+        "schema": MODULE.PR_BODY_MARKER_SCHEMA,
+    }
+    marker = (
+        MODULE.PR_BODY_MARKER_PREFIX
+        + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + MODULE.PR_BODY_MARKER_SUFFIX
+    )
+    return f"Release evidence for the exact reviewed head.\n\n{marker}\n"
+
+
+def exact_job_evidence(
+    name: str,
+    job_id: int,
+    run_id: int,
+    run_attempt: int,
+    check_suite_id: int,
+    conclusion: str = "success",
+) -> dict:
     return {
-        "id": MODULE.GOVERNED_RULESET_ID,
-        "name": MODULE.GOVERNED_RULESET_NAME,
-        "source": MODULE.GOVERNED_RULESET_SOURCE,
-        "source_type": "Organization",
-        "target": "branch",
-        "enforcement": "active",
-        "bypass_actors": [],
-        "conditions": {
-            "repository_id": {
-                "repository_ids": list(MODULE.TARGET_REPOSITORY_IDS.values())
-            },
-            "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
-        },
-        "rules": [
-            {
-                "type": "pull_request",
-                "parameters": {
-                    "required_approving_review_count": 0,
-                    "dismiss_stale_reviews_on_push": True,
-                    "require_code_owner_review": False,
-                    "require_last_push_approval": False,
-                    "required_review_thread_resolution": True,
-                    "required_reviewers": [],
-                    "allowed_merge_methods": ["squash", "rebase"],
-                },
-            },
-            {"type": "non_fast_forward"},
-            {"type": "required_linear_history"},
-            {"type": "required_signatures"},
-            {
-                "type": "required_status_checks",
-                "parameters": {
-                    "do_not_enforce_on_create": False,
-                    "strict_required_status_checks_policy": True,
-                    "required_status_checks": [
-                        {"context": "validate-static-space", "integration_id": 15368},
-                        {"context": "DCO", "integration_id": 15368},
-                    ],
-                },
-            },
-        ],
+        "app_id": MODULE.GITHUB_ACTIONS_INTEGRATION_ID,
+        "check_run_id": job_id,
+        "check_suite_id": check_suite_id,
+        "conclusion": conclusion,
+        "head_revision": PR_HEAD_SHA,
+        "job_id": job_id,
+        "name": name,
+        "run_attempt": run_attempt,
+        "run_id": run_id,
+        "status": "completed",
     }
 
 
-def inherited_rules(detail: dict) -> list[dict]:
-    return [
-        {
-            **copy.deepcopy(row),
-            "ruleset_id": MODULE.GOVERNED_RULESET_ID,
-            "ruleset_source": MODULE.GOVERNED_RULESET_SOURCE,
-            "ruleset_source_type": "Organization",
-        }
-        for row in detail["rules"]
+def exact_workflow_evidence(
+    repository: str,
+    *,
+    run_id: int,
+    run_attempt: int,
+    check_suite_id: int,
+    workflow_id: int,
+    workflow_name: str,
+    workflow_path: str,
+    jobs: list[dict],
+) -> dict:
+    return {
+        "base_revision": PARENT_SHA,
+        "check_suite_id": check_suite_id,
+        "conclusion": "success",
+        "event": "pull_request",
+        "head_ref": "release-candidate",
+        "head_revision": PR_HEAD_SHA,
+        "jobs": sorted(jobs, key=lambda row: (row["name"], row["job_id"])),
+        "name": workflow_name,
+        "path": workflow_path,
+        "pull_request_number": 7,
+        "repository_id": MODULE.TARGET_REPOSITORY_IDS[repository],
+        "run_attempt": run_attempt,
+        "run_id": run_id,
+        "status": "completed",
+        "workflow_id": workflow_id,
+    }
+
+
+def governed_merge_evidence(source_sha: str = SOURCE_SHA) -> dict:
+    repository = MODULE.load_config()["source_repository"]
+    body = exact_pr_body(repository)
+    release_jobs = [
+        exact_job_evidence(
+            name,
+            index + 10,
+            RELEASE_RUN_ID,
+            1,
+            RELEASE_CHECK_SUITE_ID,
+        )
+        for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS))
     ]
+    boundary_jobs = [
+        exact_job_evidence(
+            "release-boundary-required",
+            20,
+            BOUNDARY_RUN_ID,
+            1,
+            BOUNDARY_CHECK_SUITE_ID,
+        )
+    ]
+    return {
+        "schema": MODULE.GOVERNED_MERGE_SCHEMA,
+        "status": "AUTHORIZED_EXACT_GOVERNED_MERGE",
+        "source_revision": source_sha,
+        "repository": {
+            "default_branch": "main",
+            "full_name": repository,
+            "id": MODULE.TARGET_REPOSITORY_IDS[repository],
+        },
+        "push": {"before": PARENT_SHA, "after": source_sha},
+        "pull_request": {
+            "base_revision": PARENT_SHA,
+            "body_evidence": {
+                "body_sha256": MODULE.sha256_bytes(body.encode("utf-8")),
+                "head_revision": PR_HEAD_SHA,
+                "repository": repository,
+                "schema": MODULE.PR_BODY_EVIDENCE_SCHEMA,
+            },
+            "head_ref": "release-candidate",
+            "head_revision": PR_HEAD_SHA,
+            "id": 70,
+            "merge_revision": source_sha,
+            "merged_at": "2026-08-10T00:00:00Z",
+            "merged_by": "solo-owner",
+            "number": 7,
+        },
+        "required_checks": sorted(release_jobs, key=lambda row: row["name"]),
+        "release_workflow": exact_workflow_evidence(
+            repository,
+            run_id=RELEASE_RUN_ID,
+            run_attempt=1,
+            check_suite_id=RELEASE_CHECK_SUITE_ID,
+            workflow_id=MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+            workflow_name=MODULE.RELEASE_WORKFLOW_NAME,
+            workflow_path=MODULE.RELEASE_WORKFLOW_PATH,
+            jobs=release_jobs,
+        ),
+        "required_workflow": exact_workflow_evidence(
+            repository,
+            run_id=BOUNDARY_RUN_ID,
+            run_attempt=1,
+            check_suite_id=BOUNDARY_CHECK_SUITE_ID,
+            workflow_id=MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
+            workflow_name=MODULE.REQUIRED_WORKFLOW_NAME,
+            workflow_path=MODULE.REQUIRED_WORKFLOW_PATH,
+            jobs=boundary_jobs,
+        ),
+    }
+
+
+def write_authorization(root: Path, source_sha: str = SOURCE_SHA) -> Path:
+    path = root / "governed-merge.json"
+    path.write_bytes(MODULE.canonical_json(governed_merge_evidence(source_sha)))
+    return path
+
+
+def write_push_event(path: Path, source_sha: str = SOURCE_SHA) -> None:
+    repository = MODULE.load_config()["source_repository"]
+    repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
+    path.write_text(
+        json.dumps(
+            {
+                "before": PARENT_SHA,
+                "after": source_sha,
+                "ref": "refs/heads/main",
+                "repository": {
+                    "id": repository_id,
+                    "full_name": repository,
+                    "default_branch": "main",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def guard_responder(
-    detail: dict,
     *,
-    effective: object | None = None,
-    summary: object | None = None,
-    metadata: object | None = None,
+    boundary_conclusion: str = "success",
+    check_app_id: int = 15368,
+    release_conclusion: str = "success",
+    stale_boundary_success: bool = False,
+    stale_check_success: bool = False,
+    misbound_boundary: bool = False,
+    associated_pages: list[list[dict]] | None = None,
+    associated_second_pages: list[list[dict]] | None = None,
+    initial_body: str | None = None,
+    final_body: str | None = None,
+    release_attempt: int = 1,
+    current_release_attempt: int | None = None,
+    wrong_job_run: bool = False,
+    wrong_check_suite: bool = False,
+    wrong_check_url: bool = False,
+    final_main_sha: str = SOURCE_SHA,
 ):
     repository = MODULE.load_config()["source_repository"]
     repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
-    if effective is None:
-        effective = inherited_rules(detail)
-    if summary is None:
-        summary = [
-            {
-                "id": MODULE.GOVERNED_RULESET_ID,
-                "name": MODULE.GOVERNED_RULESET_NAME,
-                "source": MODULE.GOVERNED_RULESET_SOURCE,
-                "source_type": "Organization",
-                "target": "branch",
-                "enforcement": "active",
-            }
-        ]
-    if metadata is None:
-        metadata = {
-            "id": repository_id,
-            "full_name": repository,
-            "default_branch": "main",
+    body = initial_body if initial_body is not None else exact_pr_body(repository)
+    final_body = body if final_body is None else final_body
+    branch_calls = 0
+    pull_calls = 0
+    associated_scan = -1
+
+    def full_pull(pull_body: str) -> dict:
+        return {
+            "id": 70,
+            "number": 7,
+            "state": "closed",
+            "merged": True,
+            "merged_at": "2026-08-10T00:00:00Z",
+            "merge_commit_sha": SOURCE_SHA,
+            "merged_by": {"login": "solo-owner"},
+            "body": pull_body,
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"full_name": repository, "id": repository_id},
+            },
+            "head": {
+                "ref": "release-candidate",
+                "sha": PR_HEAD_SHA,
+                "repo": {"full_name": repository, "id": repository_id},
+            },
         }
 
+    def run_pull(number: int = 7) -> dict:
+        return {
+            "number": number,
+            "head": {
+                "ref": "release-candidate",
+                "sha": PR_HEAD_SHA,
+                "repo": {"id": repository_id},
+            },
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"id": repository_id},
+            },
+        }
+
+    def workflow_run(
+        run_id: int,
+        workflow_id: int,
+        name: str,
+        path: str,
+        conclusion: str,
+        attempt: int,
+        check_suite_id: int,
+        *,
+        pull_number: int = 7,
+    ) -> dict:
+        return {
+            "id": run_id,
+            "workflow_id": workflow_id,
+            "name": name,
+            "path": path,
+            "event": "pull_request",
+            "head_sha": PR_HEAD_SHA,
+            "status": "completed" if conclusion != "in_progress" else "in_progress",
+            "conclusion": None if conclusion == "in_progress" else conclusion,
+            "run_attempt": attempt,
+            "check_suite_id": check_suite_id,
+            "repository": {"full_name": repository, "id": repository_id},
+            "pull_requests": [run_pull(pull_number)],
+        }
+
+    def release_run(attempt: int = release_attempt) -> dict:
+        return workflow_run(
+            RELEASE_RUN_ID,
+            MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+            MODULE.RELEASE_WORKFLOW_NAME,
+            MODULE.RELEASE_WORKFLOW_PATH,
+            release_conclusion,
+            attempt,
+            RELEASE_CHECK_SUITE_ID,
+        )
+
+    def boundary_run(
+        run_id: int = BOUNDARY_RUN_ID,
+        conclusion: str = boundary_conclusion,
+    ) -> dict:
+        return workflow_run(
+            run_id,
+            MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
+            MODULE.REQUIRED_WORKFLOW_NAME,
+            MODULE.REQUIRED_WORKFLOW_PATH,
+            conclusion,
+            1,
+            BOUNDARY_CHECK_SUITE_ID if run_id == BOUNDARY_RUN_ID else BOUNDARY_CHECK_SUITE_ID + 100,
+            pull_number=8 if misbound_boundary else 7,
+        )
+
+    def workflow_rows() -> list[dict]:
+        rows = [release_run()]
+        if stale_boundary_success:
+            rows.append(boundary_run(BOUNDARY_RUN_ID, "success"))
+            rows.append(boundary_run(BOUNDARY_RUN_ID + 100, boundary_conclusion))
+        else:
+            rows.append(boundary_run())
+        return rows
+
+    def job(
+        job_id: int,
+        run_id: int,
+        workflow_name: str,
+        name: str,
+    ) -> dict:
+        actual_run_id = run_id + 500 if wrong_job_run and run_id == RELEASE_RUN_ID else run_id
+        check_id = job_id + 500 if wrong_check_url and run_id == RELEASE_RUN_ID else job_id
+        return {
+            "id": job_id,
+            "run_id": actual_run_id,
+            "run_url": f"https://api.github.test/repos/{repository}/actions/runs/{run_id}",
+            "head_sha": PR_HEAD_SHA,
+            "workflow_name": workflow_name,
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": f"https://github.com/{repository}/actions/runs/{run_id}/job/{job_id}",
+            "check_run_url": f"https://api.github.test/repos/{repository}/check-runs/{check_id}",
+        }
+
+    release_jobs = [
+        job(index + 10, RELEASE_RUN_ID, MODULE.RELEASE_WORKFLOW_NAME, name)
+        for index, name in enumerate(sorted(MODULE.REQUIRED_STATUS_CONTEXTS))
+    ]
+    boundary_jobs = [
+        job(20, BOUNDARY_RUN_ID, MODULE.REQUIRED_WORKFLOW_NAME, "release-boundary-required")
+    ]
+
+    def checks_for(jobs: list[dict], suite_id: int) -> list[dict]:
+        rows = []
+        for item in jobs:
+            check_id = (
+                item["id"]
+                if wrong_check_url and suite_id == RELEASE_CHECK_SUITE_ID
+                else int(item["check_run_url"].rsplit("/", 1)[1])
+            )
+            conclusion = (
+                "failure"
+                if stale_check_success and suite_id == RELEASE_CHECK_SUITE_ID
+                else item["conclusion"]
+            )
+            rows.append(
+                {
+                    "id": check_id,
+                    "name": item["name"],
+                    "head_sha": PR_HEAD_SHA,
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "url": item["check_run_url"],
+                    "details_url": item["html_url"],
+                    "check_suite": {
+                        "id": suite_id + 500
+                        if wrong_check_suite and suite_id == RELEASE_CHECK_SUITE_ID
+                        else suite_id
+                    },
+                    "app": {"id": check_app_id},
+                }
+            )
+        return rows
+
+    initial_pull = full_pull(body)
+    if associated_pages is None:
+        associated_pages = [[copy.deepcopy(initial_pull)]]
+    if associated_second_pages is None:
+        associated_second_pages = copy.deepcopy(associated_pages)
+
     def respond(url: str, token: str = "") -> object:
+        nonlocal associated_scan, branch_calls, pull_calls
         if token != "github-test-token":
             raise AssertionError("guard omitted its GitHub credential")
-        if url.endswith(f"/repos/{repository}"):
-            return metadata
-        if url.endswith(f"/repos/{repository}/branches/main"):
-            return {"commit": {"sha": SOURCE_SHA}}
-        if url.endswith(f"/repos/{repository}/rulesets?includes_parents=true"):
-            return summary
-        if url.endswith(
-            f"/repos/{repository}/rulesets/{MODULE.GOVERNED_RULESET_ID}"
-        ):
-            return detail
-        if url.endswith(f"/repos/{repository}/rules/branches/main"):
-            return effective
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        path = parsed.path
+        if path == f"/repos/{repository}":
+            return {
+                "id": repository_id,
+                "full_name": repository,
+                "default_branch": "main",
+            }
+        if path == f"/repos/{repository}/branches/main":
+            branch_calls += 1
+            return {"commit": {"sha": SOURCE_SHA if branch_calls == 1 else final_main_sha}}
+        if path == f"/repos/{repository}/commits/{SOURCE_SHA}/pulls":
+            page = int(query.get("page", ["1"])[0])
+            if page == 1:
+                associated_scan += 1
+            pages = associated_pages if associated_scan == 0 else associated_second_pages
+            return copy.deepcopy(pages[page - 1] if page <= len(pages) else [])
+        if path == f"/repos/{repository}/pulls/7":
+            pull_calls += 1
+            return full_pull(body if pull_calls == 1 else final_body)
+        if path == f"/repos/{repository}/actions/runs":
+            if query.get("head_sha") != [PR_HEAD_SHA] or query.get("event") != [
+                "pull_request"
+            ]:
+                raise AssertionError("workflow query is not exact")
+            rows = workflow_rows()
+            return {"total_count": len(rows), "workflow_runs": rows}
+        if path == f"/repos/{repository}/actions/runs/{RELEASE_RUN_ID}/attempts/{release_attempt}":
+            return release_run()
+        if path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID}/attempts/1":
+            return boundary_run()
+        if stale_boundary_success and path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID + 100}/attempts/1":
+            return boundary_run(BOUNDARY_RUN_ID + 100, boundary_conclusion)
+        if path == f"/repos/{repository}/actions/runs/{RELEASE_RUN_ID}/attempts/{release_attempt}/jobs":
+            return {"total_count": len(release_jobs), "jobs": copy.deepcopy(release_jobs)}
+        if path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID}/attempts/1/jobs":
+            return {"total_count": len(boundary_jobs), "jobs": copy.deepcopy(boundary_jobs)}
+        if stale_boundary_success and path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID + 100}/attempts/1/jobs":
+            stale_jobs = [
+                job(
+                    120,
+                    BOUNDARY_RUN_ID + 100,
+                    MODULE.REQUIRED_WORKFLOW_NAME,
+                    "release-boundary-required",
+                )
+            ]
+            return {"total_count": 1, "jobs": stale_jobs}
+        if path == f"/repos/{repository}/check-suites/{RELEASE_CHECK_SUITE_ID}/check-runs":
+            rows = checks_for(release_jobs, RELEASE_CHECK_SUITE_ID)
+            return {"total_count": len(rows), "check_runs": rows}
+        if path == f"/repos/{repository}/check-suites/{BOUNDARY_CHECK_SUITE_ID}/check-runs":
+            rows = checks_for(boundary_jobs, BOUNDARY_CHECK_SUITE_ID)
+            return {"total_count": len(rows), "check_runs": rows}
+        if path == f"/repos/{repository}/actions/runs/{RELEASE_RUN_ID}":
+            return release_run(
+                release_attempt
+                if current_release_attempt is None
+                else current_release_attempt
+            )
+        if path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID}":
+            return boundary_run()
+        if stale_boundary_success and path == f"/repos/{repository}/actions/runs/{BOUNDARY_RUN_ID + 100}":
+            return boundary_run(BOUNDARY_RUN_ID + 100, boundary_conclusion)
         raise AssertionError(f"unexpected guard URL: {url}")
 
     return respond
@@ -179,7 +507,7 @@ def write_deploy_result(bundle: Path, result_path: Path) -> dict:
         "bundle_sha256": manifest["bundle_sha256"],
         "target": MODULE.load_config()["target"],
         "upload_transport": "RETURNED_AUTHORITATIVE_REVISION",
-        "authorization": {"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
+        "authorization": governed_merge_evidence(),
     }
     result_path.write_bytes(MODULE.canonical_json(result))
     return result
@@ -245,6 +573,21 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertEqual(packages["huggingface-hub"], "1.19.0")
         self.assertGreaterEqual(len(packages), 20)
 
+    def test_validator_lock_is_minimal_cross_platform_and_hash_closed(self) -> None:
+        lock = (ROOT / "requirements" / "hf-validator.lock").read_text(
+            encoding="utf-8"
+        )
+        requirements = re.findall(r"(?m)^([A-Za-z0-9_.-]+)==([^\s\\]+)", lock)
+        hashes = set(re.findall(r"--hash=sha256:([0-9a-f]{64})", lock))
+        self.assertEqual(requirements, [("PyYAML", "6.0.3")])
+        self.assertEqual(
+            hashes,
+            {
+                "ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc",
+                "5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b",
+            },
+        )
+
     def test_repository_identity_is_one_exact_governed_target(self) -> None:
         config = MODULE.load_config()
         expected = {
@@ -261,7 +604,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             "SZLHOLDINGS/" + config["source_repository"].split("/", 1)[1],
         )
 
-    def test_guard_authorizes_solo_exact_default_policy(self) -> None:
+    def test_guard_authorizes_exact_governed_merge(self) -> None:
         repository = MODULE.load_config()["source_repository"]
         environment = {
             "GITHUB_REPOSITORY": repository,
@@ -269,19 +612,47 @@ class StaticSpaceContractTests(unittest.TestCase):
             "GITHUB_TOKEN": "github-test-token",
             "GITHUB_API_URL": "https://api.github.test",
         }
-        with mock.patch.dict(os.environ, environment, clear=False):
-            with mock.patch.object(
-                MODULE, "_request_json", side_effect=guard_responder(strong_ruleset())
-            ):
-                result = MODULE.require_governed_main(SOURCE_SHA)
-        self.assertEqual(result["status"], "AUTHORIZED_EXACT_PROTECTED_MAIN")
-        self.assertEqual(result["ruleset_ids"], [MODULE.GOVERNED_RULESET_ID])
-        self.assertEqual(
-            result["repository_id"], MODULE.TARGET_REPOSITORY_IDS[repository]
-        )
-        self.assertEqual(result["required_status_contexts"], ["DCO", "validate-static-space"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            output_path = root / "governed-merge.json"
+            failure_path = root / "governed-merge-failure.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    MODULE, "_request_json", side_effect=guard_responder()
+                ):
+                    result = MODULE.require_governed_main(
+                        SOURCE_SHA,
+                        event_path,
+                        output_path,
+                        failure_output_path=failure_path,
+                    )
+            self.assertEqual(result["status"], "AUTHORIZED_EXACT_GOVERNED_MERGE")
+            self.assertEqual(result["schema"], MODULE.GOVERNED_MERGE_SCHEMA)
+            self.assertEqual(result["push"], {"before": PARENT_SHA, "after": SOURCE_SHA})
+            self.assertEqual(result["pull_request"]["head_revision"], PR_HEAD_SHA)
+            self.assertEqual(
+                result["pull_request"]["body_evidence"]["schema"],
+                MODULE.PR_BODY_EVIDENCE_SCHEMA,
+            )
+            self.assertEqual(result["release_workflow"]["run_attempt"], 1)
+            self.assertEqual(
+                {row["name"] for row in result["release_workflow"]["jobs"]},
+                set(MODULE.REQUIRED_STATUS_CONTEXTS),
+            )
+            self.assertEqual(
+                result["required_workflow"]["workflow_id"],
+                MODULE.TARGET_REQUIRED_WORKFLOW_IDS[repository],
+            )
+            self.assertEqual(
+                result["release_workflow"]["workflow_id"],
+                MODULE.TARGET_RELEASE_WORKFLOW_IDS[repository],
+            )
+            self.assertEqual(output_path.read_bytes(), MODULE.canonical_json(result))
+            self.assertFalse(failure_path.exists())
 
-    def test_guard_rejects_weak_rulesets(self) -> None:
+    def test_guard_rejects_direct_push_and_spoofed_required_evidence(self) -> None:
         repository = MODULE.load_config()["source_repository"]
         environment = {
             "GITHUB_REPOSITORY": repository,
@@ -289,74 +660,73 @@ class StaticSpaceContractTests(unittest.TestCase):
             "GITHUB_TOKEN": "github-test-token",
             "GITHUB_API_URL": "https://api.github.test",
         }
-        variants: dict[str, dict] = {}
-        no_signatures = strong_ruleset()
-        no_signatures["rules"] = [
-            row for row in no_signatures["rules"] if row["type"] != "required_signatures"
-        ]
-        variants["no signatures"] = no_signatures
-        no_dco = strong_ruleset()
-        checks = next(
-            row for row in no_dco["rules"] if row["type"] == "required_status_checks"
-        )
-        checks["parameters"]["required_status_checks"] = [
-            {"context": "validate-static-space", "integration_id": 15368}
-        ]
-        variants["no DCO"] = no_dco
-        excluded_main = strong_ruleset()
-        excluded_main["conditions"]["ref_name"]["exclude"] = ["refs/heads/main"]
-        variants["excluded main"] = excluded_main
-        with mock.patch.dict(os.environ, environment, clear=False):
-            for label, detail in variants.items():
-                with self.subTest(label=label):
-                    with mock.patch.object(
-                        MODULE, "_request_json", side_effect=guard_responder(detail)
-                    ):
-                        with self.assertRaisesRegex(
-                            MODULE.ContractError, "does not match the exact"
-                        ):
-                            MODULE.require_governed_main(SOURCE_SHA)
-
-    def test_guard_rejects_substitute_local_or_ineffective_ruleset(self) -> None:
-        repository = MODULE.load_config()["source_repository"]
-        environment = {
-            "GITHUB_REPOSITORY": repository,
-            "GITHUB_REF": "refs/heads/main",
-            "GITHUB_TOKEN": "github-test-token",
-            "GITHUB_API_URL": "https://api.github.test",
-        }
-        local = strong_ruleset()
-        local["source"] = repository
-        local["source_type"] = "Repository"
-        with mock.patch.dict(os.environ, environment, clear=False):
-            with mock.patch.object(
-                MODULE, "_request_json", side_effect=guard_responder(local)
-            ):
-                with self.assertRaisesRegex(MODULE.ContractError, "does not match the exact"):
-                    MODULE.require_governed_main(SOURCE_SHA)
-            with mock.patch.object(
-                MODULE,
-                "_request_json",
-                side_effect=guard_responder(strong_ruleset(), effective=[]),
-            ):
-                with self.assertRaisesRegex(MODULE.ContractError, "not fully effective"):
-                    MODULE.require_governed_main(SOURCE_SHA)
-            wrong_metadata = {
-                "id": 1,
-                "full_name": repository,
-                "default_branch": "main",
-            }
-            with mock.patch.object(
-                MODULE,
-                "_request_json",
-                side_effect=guard_responder(
-                    strong_ruleset(), metadata=wrong_metadata
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            variants = [
+                (
+                    "failed boundary",
+                    guard_responder(boundary_conclusion="failure"),
+                    "latest exact required release-boundary workflow",
                 ),
-            ):
-                with self.assertRaisesRegex(MODULE.ContractError, "identity"):
-                    MODULE.require_governed_main(SOURCE_SHA)
+                (
+                    "stale boundary success",
+                    guard_responder(
+                        boundary_conclusion="failure", stale_boundary_success=True
+                    ),
+                    "latest exact required release-boundary workflow",
+                ),
+                (
+                    "stale check success",
+                    guard_responder(stale_check_success=True),
+                    "job/check binding",
+                ),
+                (
+                    "misbound boundary",
+                    guard_responder(misbound_boundary=True),
+                    "exact required release-boundary workflow did not run",
+                ),
+                (
+                    "failed publisher workflow",
+                    guard_responder(release_conclusion="failure"),
+                    "latest exact publisher workflow",
+                ),
+                (
+                    "wrong check app",
+                    guard_responder(check_app_id=99),
+                    "job/check binding",
+                ),
+            ]
+            with mock.patch.dict(os.environ, environment, clear=False):
+                for label, responder, diagnostic in variants:
+                    with self.subTest(label=label):
+                        with mock.patch.object(
+                            MODULE, "_request_json", side_effect=responder
+                        ):
+                            with self.assertRaisesRegex(MODULE.ContractError, diagnostic):
+                                MODULE.require_governed_main(
+                                    SOURCE_SHA,
+                                    event_path,
+                                    root / f"{label}.json",
+                                    failure_output_path=root / f"{label}-failure.json",
+                                )
+            direct_event = json.loads(event_path.read_text(encoding="utf-8"))
+            direct_event["before"] = "e" * 40
+            event_path.write_text(json.dumps(direct_event), encoding="utf-8")
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    MODULE, "_request_json", side_effect=guard_responder()
+                ):
+                    with self.assertRaisesRegex(MODULE.ContractError, "unambiguous merged PR"):
+                        MODULE.require_governed_main(
+                            SOURCE_SHA,
+                            event_path,
+                            root / "direct.json",
+                            failure_output_path=root / "direct-failure.json",
+                        )
 
-    def test_guard_rejects_status_context_bound_to_wrong_integration(self) -> None:
+    def test_guard_paginates_complete_stable_associated_pr_inventory(self) -> None:
         repository = MODULE.load_config()["source_repository"]
         environment = {
             "GITHUB_REPOSITORY": repository,
@@ -364,17 +734,256 @@ class StaticSpaceContractTests(unittest.TestCase):
             "GITHUB_TOKEN": "github-test-token",
             "GITHUB_API_URL": "https://api.github.test",
         }
-        detail = strong_ruleset()
-        checks = next(
-            row for row in detail["rules"] if row["type"] == "required_status_checks"
-        )
-        checks["parameters"]["required_status_checks"][1]["integration_id"] = 99
-        with mock.patch.dict(os.environ, environment, clear=False):
-            with mock.patch.object(
-                MODULE, "_request_json", side_effect=guard_responder(detail)
-            ):
-                with self.assertRaisesRegex(MODULE.ContractError, "does not match the exact"):
-                    MODULE.require_governed_main(SOURCE_SHA)
+        candidate = {
+            "id": 70,
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-10T00:00:00Z",
+            "merge_commit_sha": SOURCE_SHA,
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"full_name": repository},
+            },
+        }
+        noise = [{"id": 1000 + index, "state": "open"} for index in range(100)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    MODULE,
+                    "_request_json",
+                    side_effect=guard_responder(
+                        associated_pages=[noise, [candidate]],
+                    ),
+                ):
+                    result = MODULE.require_governed_main(
+                        SOURCE_SHA, event_path, root / "authorization.json"
+                    )
+            self.assertEqual(result["pull_request"]["id"], 70)
+
+    def test_guard_rejects_incomplete_ambiguous_or_drifting_pr_inventory(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        candidate = {
+            "id": 70,
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-10T00:00:00Z",
+            "merge_commit_sha": SOURCE_SHA,
+            "base": {
+                "ref": "main",
+                "sha": PARENT_SHA,
+                "repo": {"full_name": repository},
+            },
+        }
+        second = copy.deepcopy(candidate)
+        second.update({"id": 71, "number": 8})
+        noise = [{"id": 1000 + index, "state": "open"} for index in range(99)]
+        duplicate_page = [{"id": 1000, "state": "open"}]
+        variants = [
+            (
+                "ambiguous later page",
+                guard_responder(
+                    associated_pages=[[candidate, *noise], [second]]
+                ),
+                "unambiguous merged PR",
+            ),
+            (
+                "duplicate across pages",
+                guard_responder(
+                    associated_pages=[[candidate, *noise], duplicate_page]
+                ),
+                "malformed or duplicated",
+            ),
+            (
+                "snapshot drift",
+                guard_responder(
+                    associated_pages=[[candidate]],
+                    associated_second_pages=[
+                        [candidate, {"id": 72, "state": "open"}]
+                    ],
+                ),
+                "inventory changed",
+            ),
+            (
+                "main drift",
+                guard_responder(final_main_sha=TARGET_SHA),
+                "protected main changed",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                for label, responder, diagnostic in variants:
+                    with self.subTest(label=label):
+                        with mock.patch.object(
+                            MODULE, "_request_json", side_effect=responder
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.ContractError, diagnostic
+                            ):
+                                MODULE.require_governed_main(
+                                    SOURCE_SHA,
+                                    event_path,
+                                    root / f"{label}.json",
+                                )
+
+    def test_guard_rejects_attempt_job_and_check_misbinding(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        variants = [
+            ("job from another run", guard_responder(wrong_job_run=True), "job/check binding"),
+            ("check from another suite", guard_responder(wrong_check_suite=True), "job/check binding"),
+            ("job/check URL mismatch", guard_responder(wrong_check_url=True), "job/check binding"),
+            (
+                "new run attempt",
+                guard_responder(current_release_attempt=2),
+                "advanced after exact-attempt",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                for label, responder, diagnostic in variants:
+                    with self.subTest(label=label):
+                        with mock.patch.object(
+                            MODULE, "_request_json", side_effect=responder
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.ContractError, diagnostic
+                            ):
+                                MODULE.require_governed_main(
+                                    SOURCE_SHA,
+                                    event_path,
+                                    root / f"{label}.json",
+                                )
+
+    def test_exact_pr_body_marker_and_event_binding(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
+        body = exact_pr_body(repository)
+        evidence = MODULE.exact_pr_body_evidence(body, repository, PR_HEAD_SHA)
+        self.assertEqual(evidence["schema"], MODULE.PR_BODY_EVIDENCE_SCHEMA)
+        marker = body.strip().splitlines()[-1]
+        invalid = [
+            None,
+            body + marker + "\n",
+            body.replace(PR_HEAD_SHA, TARGET_SHA),
+            body.replace(repository, "szl-holdings/other"),
+            body.replace('"schema":"szl.pr-head/v1"', '"schema":"wrong"'),
+        ]
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(MODULE.ContractError):
+                    MODULE.exact_pr_body_evidence(value, repository, PR_HEAD_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "pull-event.json"
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "repository": {"id": repository_id, "full_name": repository},
+                        "pull_request": {
+                            "body": body,
+                            "head": {
+                                "sha": PR_HEAD_SHA,
+                                "repo": {
+                                    "id": repository_id,
+                                    "full_name": repository,
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                MODULE.validate_pr_body_event(PR_HEAD_SHA, event_path), evidence
+            )
+
+    def test_guard_rejects_pr_body_drift_after_exact_checks(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        body = exact_pr_body(repository)
+        changed = body.replace("Release evidence", "Changed release evidence")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    MODULE,
+                    "_request_json",
+                    side_effect=guard_responder(
+                        initial_body=body, final_body=changed
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.ContractError, "evidence changed"
+                    ):
+                        MODULE.require_governed_main(
+                            SOURCE_SHA, event_path, root / "authorization.json"
+                        )
+
+    def test_governed_merge_evidence_is_canonical_and_source_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authorization = write_authorization(root)
+            loaded = MODULE.load_governed_merge(authorization, SOURCE_SHA)
+            self.assertEqual(loaded, governed_merge_evidence())
+            authorization.write_text(
+                json.dumps(governed_merge_evidence(), indent=2), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(MODULE.ContractError, "not canonical"):
+                MODULE.load_governed_merge(authorization, SOURCE_SHA)
+            authorization.write_bytes(
+                MODULE.canonical_json(governed_merge_evidence(TARGET_SHA))
+            )
+            with self.assertRaisesRegex(MODULE.ContractError, "not bound"):
+                MODULE.load_governed_merge(authorization, SOURCE_SHA)
+
+    def test_governed_merge_v3_rejects_body_and_job_binding_tamper(self) -> None:
+        variants = []
+        wrong_body = governed_merge_evidence()
+        wrong_body["pull_request"]["body_evidence"]["head_revision"] = TARGET_SHA
+        variants.append(wrong_body)
+        wrong_attempt = governed_merge_evidence()
+        wrong_attempt["release_workflow"]["jobs"][0]["run_attempt"] = 2
+        variants.append(wrong_attempt)
+        wrong_suite = governed_merge_evidence()
+        wrong_suite["required_workflow"]["jobs"][0]["check_suite_id"] += 1
+        variants.append(wrong_suite)
+        wrong_required = governed_merge_evidence()
+        wrong_required["required_checks"] = wrong_required["required_checks"][:-1]
+        variants.append(wrong_required)
+        with tempfile.TemporaryDirectory() as temporary:
+            authorization = Path(temporary) / "governed-merge.json"
+            for index, evidence in enumerate(variants):
+                with self.subTest(index=index):
+                    authorization.write_bytes(MODULE.canonical_json(evidence))
+                    with self.assertRaises(MODULE.ContractError):
+                        MODULE.load_governed_merge(authorization, SOURCE_SHA)
 
     def test_guard_api_error_fails_closed(self) -> None:
         with mock.patch.object(
@@ -385,6 +994,57 @@ class StaticSpaceContractTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ContractError, "JSON request failed closed"):
                 MODULE._request_json("https://api.github.test/repos/example/repo", "token")
 
+    def test_public_main_freshness_is_anonymous_exact_and_canonical(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        ref_url = f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/ref/heads/main"
+        commit_url = (
+            f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{SOURCE_SHA}"
+        )
+        responses = [
+            {
+                "ref": "refs/heads/main",
+                "object": {"type": "commit", "sha": SOURCE_SHA, "url": commit_url},
+            },
+            {"sha": SOURCE_SHA, "url": commit_url},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "github-main-freshness.json"
+            with mock.patch.object(
+                MODULE, "_request_json", side_effect=responses
+            ) as request_json:
+                evidence = MODULE.require_public_main_fresh(SOURCE_SHA, output)
+            self.assertEqual(
+                request_json.call_args_list,
+                [mock.call(ref_url), mock.call(commit_url)],
+            )
+            self.assertEqual(evidence["schema"], "szl.github-public-main-freshness/v1")
+            self.assertEqual(evidence["status"], "PUBLIC_MAIN_FRESH")
+            self.assertEqual(evidence["credential_mode"], "anonymous_public_api")
+            self.assertEqual(evidence["source_revision"], SOURCE_SHA)
+            self.assertEqual(output.read_bytes(), MODULE.canonical_json(evidence))
+
+    def test_public_main_freshness_rejects_stale_or_malformed_responses(self) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        commit_url = (
+            f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{SOURCE_SHA}"
+        )
+        variants = (
+            [{"ref": "refs/heads/main", "object": {"type": "commit", "sha": TARGET_SHA, "url": commit_url}}],
+            [{"ref": "refs/heads/main", "object": {"type": "tag", "sha": SOURCE_SHA, "url": commit_url}}],
+            [
+                {"ref": "refs/heads/main", "object": {"type": "commit", "sha": SOURCE_SHA, "url": commit_url}},
+                {"sha": TARGET_SHA, "url": commit_url},
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, responses in enumerate(variants):
+                with self.subTest(index=index):
+                    with mock.patch.object(MODULE, "_request_json", side_effect=responses):
+                        with self.assertRaisesRegex(MODULE.ContractError, "public main"):
+                            MODULE.require_public_main_fresh(
+                                SOURCE_SHA, Path(temporary) / f"stale-{index}.json"
+                            )
+
     def test_guard_missing_token_fails_closed_before_api(self) -> None:
         repository = MODULE.load_config()["source_repository"]
         environment = {
@@ -392,11 +1052,19 @@ class StaticSpaceContractTests(unittest.TestCase):
             "GITHUB_REF": "refs/heads/main",
             "GITHUB_TOKEN": "",
         }
-        with mock.patch.dict(os.environ, environment, clear=False):
-            with mock.patch.object(MODULE, "_request_json") as request_json:
-                with self.assertRaisesRegex(MODULE.ContractError, "GITHUB_TOKEN is required"):
-                    MODULE.require_governed_main(SOURCE_SHA)
-        request_json.assert_not_called()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(MODULE, "_request_json") as request_json:
+                    with self.assertRaisesRegex(
+                        MODULE.ContractError, "GITHUB_TOKEN is required"
+                    ):
+                        MODULE.require_governed_main(
+                            SOURCE_SHA, event_path, root / "authorization.json"
+                        )
+            request_json.assert_not_called()
 
     def test_dco_validates_every_commit_with_matching_trailer(self) -> None:
         commits = ["1" * 40, "2" * 40]
@@ -455,61 +1123,317 @@ class StaticSpaceContractTests(unittest.TestCase):
                 MODULE.validate_dco_range(SOURCE_SHA, TARGET_SHA)
 
     def test_workflow_exposes_stable_dco_and_exact_python(self) -> None:
-        workflow = (
-            ROOT / ".github" / "workflows" / "hf-static-space.yml"
-        ).read_text(encoding="utf-8")
-        self.assertIn("  dco:\n    name: DCO\n", workflow)
-        self.assertIn('python-version: "3.12.13"', workflow)
-        self.assertNotIn('python-version: "3.12"\n', workflow)
-        self.assertIn("needs: [validate, dco]", workflow)
+        workflow_path = ROOT / ".github" / "workflows" / "hf-static-space.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+        document = yaml.safe_load(workflow)
+        jobs = document["jobs"]
         self.assertIn(
-            "format('pr-{0}', github.event.pull_request.number) || 'production'",
+            "types: [opened, synchronize, reopened, edited, ready_for_review]",
             workflow,
         )
-        self.assertIn(
-            "actions/create-github-app-token@"
-            "bcd2ba49218906704ab6c1aa796996da409d3eb1",
-            workflow,
+        self.assertIn("hf_static_space.py pr-body", workflow)
+        validate_text = json.dumps(jobs["validate"], sort_keys=True)
+        self.assertEqual(jobs["dco"]["name"], "DCO")
+        self.assertEqual(jobs["validate"]["name"], "validate-static-space")
+        self.assertEqual(jobs["authorize"]["needs"], ["validate", "dco"])
+        self.assertEqual(
+            jobs["authorize"]["permissions"],
+            {
+                "actions": "read",
+                "checks": "read",
+                "contents": "read",
+                "pull-requests": "read",
+            },
         )
-        self.assertIn("permission-administration: read", workflow)
-        self.assertIn("permission-contents: read", workflow)
-        self.assertIn('test -n "$GOVERNANCE_TOKEN"', workflow)
-        token = workflow.index("Mint least-privilege governed ruleset reader")
-        guard = workflow.index("Reauthorize exact governed main without HF credentials")
-        hf_credential = workflow.index("HF_TOKEN: ${{ secrets.HF_TOKEN }}")
-        self.assertLess(token, guard)
-        self.assertLess(guard, hf_credential)
-        self.assertIn(
-            "GITHUB_TOKEN: ${{ steps.governance-token.outputs.token }}",
-            workflow,
+        self.assertEqual(jobs["deploy"]["permissions"], {})
+        self.assertEqual(jobs["measure"]["timeout-minutes"], 20)
+        self.assertEqual(
+            jobs["attest"]["permissions"],
+            {"attestations": "write", "contents": "read", "id-token": "write"},
         )
-        self.assertNotIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
-        self.assertIn('python -I -m venv "$VALIDATOR_VENV"', workflow)
-        self.assertIn('test ! -e "$VALIDATOR_VENV"', workflow)
-        self.assertIn('python -I -m venv "$PUBLISHER_VENV"', workflow)
-        self.assertIn('test ! -e "$PUBLISHER_VENV"', workflow)
+        self.assertEqual(
+            jobs["attest"]["if"],
+            "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        )
+        authorize_text = json.dumps(jobs["authorize"], sort_keys=True)
+        deploy_text = json.dumps(jobs["deploy"], sort_keys=True)
+        measure_text = json.dumps(jobs["measure"], sort_keys=True)
+        attest_text = json.dumps(jobs["attest"], sort_keys=True)
+        authorize_steps = {
+            step.get("id"): step for step in jobs["authorize"]["steps"] if step.get("id")
+        }
+        deploy_steps = {
+            step.get("id"): step for step in jobs["deploy"]["steps"] if step.get("id")
+        }
+        measure_steps = {
+            step.get("id"): step for step in jobs["measure"]["steps"] if step.get("id")
+        }
+        attest_steps = {
+            step.get("id"): step for step in jobs["attest"]["steps"] if step.get("id")
+        }
+        self.assertEqual(
+            jobs["authorize"]["outputs"]["authorization-evidence-outcome"],
+            "${{ steps.authorization-evidence.outcome }}",
+        )
+        self.assertEqual(
+            jobs["deploy"]["outputs"]["publisher-freshness-outcome"],
+            "${{ steps.publisher-freshness.outcome }}",
+        )
+        self.assertIs(
+            authorize_steps["publisher-input-evidence"]["with"]["include-hidden-files"],
+            True,
+        )
+        self.assertIn("needs.authorize.result == 'success'", jobs["deploy"]["if"])
+        self.assertIn(
+            "needs.authorize.outputs.authorization-evidence-outcome == 'success'",
+            jobs["deploy"]["if"],
+        )
+        self.assertIn(
+            'mkdir -p "$RUNNER_TEMP/publication-evidence"',
+            deploy_steps["publisher-environment"]["run"],
+        )
+        self.assertIn(
+            'echo "PUBLISHER_VENV=$PUBLISHER_VENV" >> "$GITHUB_ENV"',
+            deploy_steps["publisher-environment"]["run"],
+        )
+        self.assertIn(
+            "steps.publisher-evidence-download.outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
+        self.assertIn(
+            "steps.measurement-evidence-download.outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
+        self.assertEqual(jobs["measure"]["needs"], ["authorize", "deploy"])
+        self.assertIn(
+            "needs.measure.outputs.measurement-rebind-outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
+        self.assertIn(
+            "needs.measure.outputs.measurement-environment-outcome == 'success'",
+            attest_steps["oidc"]["if"],
+        )
+        self.assertNotIn("HF_TOKEN", authorize_text)
+        self.assertIn("publisher_script_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("publisher_lock_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("publisher_config_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("authorization_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("bundle_manifest_sha256", jobs["authorize"]["outputs"])
+        self.assertIn("requirements/hf-validator.lock", validate_text)
+        self.assertNotIn("requirements/hf-publisher.lock", validate_text)
+        self.assertNotIn("huggingface_hub", validate_text)
+        self.assertNotIn("${{ github.token }}", deploy_text)
+        self.assertNotIn("actions/checkout@", deploy_text)
+        self.assertIn('"GITHUB_TOKEN": ""', deploy_text)
+        self.assertIn('"HF_TOKEN": "${{ secrets.HF_TOKEN }}"', deploy_text)
+        self.assertIn('"HF_TOKEN": ""', measure_text)
+        self.assertIn('"GITHUB_TOKEN": "${{ github.token }}"', measure_text)
+        self.assertNotIn("secrets.HF_TOKEN", attest_text)
+        self.assertIn('"GITHUB_TOKEN": ""', attest_text)
+        self.assertNotIn("actions/create-github-app-token@", workflow)
+        self.assertNotIn("QILLQAQ", workflow)
+        self.assertNotIn("permission-administration", workflow)
+        self.assertNotIn("--dry-run", workflow)
+        self.assertEqual(workflow.count("HF_TOKEN: ${{ secrets.HF_TOKEN }}"), 1)
+        self.assertEqual(workflow.count("id-token: write"), 1)
+        self.assertEqual(workflow.count("attestations: write"), 1)
         self.assertGreaterEqual(
             workflow.count("--require-hashes --only-binary=:all: --ignore-installed"),
             2,
         )
-        self.assertNotIn("--dry-run", workflow)
-        self.assertIn(
-            'm.version("huggingface-hub") == "1.19.0" == h.__version__',
-            workflow,
-        )
-        self.assertIn("id-token: write", workflow)
-        self.assertIn("attestations: write", workflow)
+        self.assertIn("--authorization-outcome", workflow)
+        self.assertIn("--authorization-evidence-outcome", workflow)
+        self.assertIn("--publisher-environment-outcome", workflow)
+        self.assertIn("--publisher-freshness-outcome", workflow)
+        self.assertIn("--publisher-rebind-outcome", workflow)
+        self.assertIn("--publisher-evidence-outcome", workflow)
+        self.assertIn("--publisher-evidence-download-outcome", workflow)
+        self.assertIn("--measurement-evidence-download-outcome", workflow)
+        self.assertIn("--measurement-hardening-outcome", workflow)
+        self.assertIn("--measurement-input-outcome", workflow)
+        self.assertIn("--measurement-rebind-outcome", workflow)
+        self.assertIn("--measurement-publisher-evidence-outcome", workflow)
+        self.assertIn("--measurement-environment-outcome", workflow)
+        self.assertIn("--attestation-checkout-outcome", workflow)
+        self.assertIn("--authorization", workflow)
+        self.assertIn("--authorization-output", workflow)
+        self.assertIn("Require terminal governed success", workflow)
         self.assertIn(
             "actions/attest-build-provenance@"
             "a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32",
             workflow,
         )
-        self.assertIn('"$PUBLISHER_PYTHON" -I scripts/hf_static_space.py deploy', workflow)
-        self.assertIn('"$PUBLISHER_PYTHON" -I scripts/hf_static_space.py attest', workflow)
-        self.assertIn("--failure-output", workflow)
-        self.assertIn("workflow-outcome", workflow)
-        self.assertIn("Require terminal governed success", workflow)
-        self.assertIn("hf-publication-partial.json", workflow)
+        deploy_steps = jobs["deploy"]["steps"]
+        positions = {step["name"]: index for index, step in enumerate(deploy_steps)}
+        rebind_name = "Rebind five publisher inputs before interpretation or credentials"
+        freshness_name = "Reconfirm public main at exact source revision without credentials"
+        self.assertLess(
+            positions[rebind_name],
+            positions["Install pinned Hugging Face client without repository credentials"],
+        )
+        self.assertLess(
+            positions[rebind_name],
+            positions["Classify publisher-environment failure before credential materialization"],
+        )
+        self.assertLess(
+            positions[rebind_name],
+            positions["Publish exact bundle with only the Hugging Face credential"],
+        )
+        self.assertLess(
+            positions["Install pinned Hugging Face client without repository credentials"],
+            positions[freshness_name],
+        )
+        self.assertLess(
+            positions[freshness_name],
+            positions["Publish exact bundle with only the Hugging Face credential"],
+        )
+        rebind_step = deploy_steps[positions[rebind_name]]
+        self.assertNotIn("HF_TOKEN", rebind_step["env"])
+        self.assertNotIn("python", rebind_step["run"])
+        self.assertNotRegex(
+            rebind_step["run"],
+            r"(?mi)(?:^|[;&|])\s*(?:pip3?|python(?:3(?:\.\d+)?)?\s+-m\s+pip)\b",
+        )
+        for step_name in (
+            "Set up exact Python",
+            "Install pinned Hugging Face client without repository credentials",
+            "Classify publisher-environment failure before credential materialization",
+            freshness_name,
+            "Classify public-main freshness failure before mutation",
+            "Publish exact bundle with only the Hugging Face credential",
+        ):
+            self.assertIn(
+                "publisher-rebind.outcome == 'success'",
+                deploy_steps[positions[step_name]].get("if", ""),
+            )
+        freshness_step = deploy_steps[positions[freshness_name]]
+        self.assertEqual(
+            freshness_step["env"],
+            {"GITHUB_TOKEN": "", "GH_TOKEN": "", "HF_TOKEN": ""},
+        )
+        self.assertIn("fresh-main", freshness_step["run"])
+        self.assertIn("/usr/bin/env -i", freshness_step["run"])
+        freshness_isolated = freshness_step["run"].split("/usr/bin/env -i", 1)[1].split(
+            '"$PUBLISHER_PYTHON"', 1
+        )[0]
+        self.assertEqual(
+            set(re.findall(r"(?m)^\s*([A-Z][A-Z0-9_]*)=", freshness_isolated)),
+            {"HOME", "HF_HOME", "XDG_CACHE_HOME", "PATH", "LANG", "LC_ALL", "PYTHONIOENCODING"},
+        )
+        for forbidden in ("ACTIONS_", "GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN"):
+            self.assertNotIn(forbidden, freshness_isolated)
+        self.assertIn(
+            "publisher-freshness.outcome == 'success'",
+            deploy_steps[positions[
+                "Publish exact bundle with only the Hugging Face credential"
+            ]]["if"],
+        )
+        publish_run = deploy_steps[positions[
+            "Publish exact bundle with only the Hugging Face credential"
+        ]]["run"]
+        self.assertIn("/usr/bin/env -i", publish_run)
+        isolated = publish_run.split("/usr/bin/env -i", 1)[1].split(
+            '"$PUBLISHER_PYTHON"', 1
+        )[0]
+        assignments = set(
+            re.findall(r"(?m)^\s*([A-Z][A-Z0-9_]*)=", isolated)
+        )
+        self.assertEqual(
+            assignments,
+            {
+                "HOME",
+                "HF_HOME",
+                "XDG_CACHE_HOME",
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "PYTHONIOENCODING",
+                "HF_TOKEN",
+            },
+        )
+        for forbidden in (
+            "ACTIONS_",
+            "GITHUB_ENV",
+            "GITHUB_OUTPUT",
+            "GITHUB_PATH",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+        ):
+            self.assertNotIn(forbidden, isolated)
+
+        artifact_steps = [
+            step
+            for job in jobs.values()
+            for step in job.get("steps", [])
+            if str(step.get("uses", "")).startswith(
+                ("actions/upload-artifact@", "actions/download-artifact@")
+            )
+        ]
+        self.assertGreater(len(artifact_steps), 0)
+        for step in artifact_steps:
+            artifact_name = step["with"]["name"]
+            self.assertIn("${{ github.sha }}", artifact_name)
+            self.assertIn("${{ github.run_attempt }}", artifact_name)
+
+        measurement_rebind = measure_steps["measurement-rebind"]
+        self.assertEqual(
+            set(measurement_rebind["env"]),
+            {
+                "EXPECTED_PUBLISHER_SCRIPT_SHA256",
+                "EXPECTED_PUBLISHER_LOCK_SHA256",
+                "EXPECTED_PUBLISHER_CONFIG_SHA256",
+                "EXPECTED_AUTHORIZATION_SHA256",
+                "EXPECTED_BUNDLE_MANIFEST_SHA256",
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                "HF_TOKEN",
+            },
+        )
+        self.assertEqual(measurement_rebind["run"].count("require_digest \"$EXPECTED_"), 5)
+        self.assertIn(
+            "steps.measurement-rebind.outcome == 'success'",
+            measure_steps["measurement-publisher-evidence"]["if"],
+        )
+        self.assertIn(
+            "steps.measurement-environment.outcome == 'success'",
+            measure_steps["measurement"]["if"],
+        )
+
+        outcome_step = attest_steps["workflow-outcome"]
+        self.assertIs(outcome_step["continue-on-error"], True)
+        self.assertIn("terminal_synthesizer_bootstrap", outcome_step["run"])
+        self.assertIn("hf-workflow-stage-failure.json", outcome_step["run"])
+        for step in jobs["attest"]["steps"]:
+            if step.get("id") == "oidc":
+                continue
+            self.assertEqual(step.get("env", {}).get("ACTIONS_ID_TOKEN_REQUEST_TOKEN"), "")
+            self.assertEqual(step.get("env", {}).get("ACTIONS_ID_TOKEN_REQUEST_URL"), "")
+        self.assertIn("publisher_executable_rebind", SCRIPT.read_text(encoding="utf-8"))
+
+    def test_rebind_failure_is_terminal_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt = root / "receipt.json"
+            failure = root / "workflow-failure.json"
+            result = MODULE.synthesize_workflow_outcome(
+                SOURCE_SHA,
+                root / "missing-result.json",
+                root / "missing-measurement.json",
+                root / "missing-mutation-failure.json",
+                root / "missing-partial.json",
+                receipt,
+                failure,
+                "skipped",
+                "skipped",
+                "skipped",
+                "skipped",
+                publisher_rebind_outcome="failure",
+            )
+            self.assertEqual(
+                result["failure_stage"], "publisher_executable_rebind"
+            )
+            self.assertFalse(receipt.exists())
+            self.assertEqual(failure.read_bytes(), MODULE.canonical_json(result))
 
     def test_deploy_uses_parent_lock_and_full_tree_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -518,21 +1442,15 @@ class StaticSpaceContractTests(unittest.TestCase):
             result_path = root / "result.json"
             failure_path = root / "failure.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
             events: list[str] = []
             api = FakeHfApi(events=events)
             fake_hub = SimpleNamespace(HfApi=lambda token: api)
-            authorization = {"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"}
-
-            def authorize(*_args):
-                events.append("guard")
-                return authorization
 
             with mock.patch.dict(
                 os.environ, {"HF_TOKEN": "test-token"}, clear=False
             ), mock.patch.dict(
                 sys.modules, {"huggingface_hub": fake_hub}
-            ), mock.patch.object(
-                MODULE, "require_governed_main", side_effect=authorize
             ), mock.patch.object(
                 MODULE, "_require_strict_mutation_timer"
             ), mock.patch.object(
@@ -544,6 +1462,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                     bundle,
                     SOURCE_SHA,
                     result_path,
+                    authorization_path=authorization_path,
                     failure_output_path=failure_path,
                 )
             assert api.upload_kwargs is not None
@@ -552,7 +1471,8 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertEqual(Path(api.upload_kwargs["folder_path"]), bundle)
             self.assertEqual(result["previous_hf_revision"], PARENT_SHA)
             self.assertEqual(result["hf_revision"], TARGET_SHA)
-            self.assertEqual(events, ["parent", "guard", "upload"])
+            self.assertEqual(events, ["parent", "upload"])
+            self.assertEqual(result["authorization"], governed_merge_evidence())
             self.assertFalse(failure_path.exists())
 
     def test_deploy_stale_parent_fails_without_result(self) -> None:
@@ -562,16 +1482,13 @@ class StaticSpaceContractTests(unittest.TestCase):
             result_path = root / "result.json"
             failure_path = root / "failure.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
             api = FakeHfApi(stale=True)
             fake_hub = SimpleNamespace(HfApi=lambda token: api)
             with mock.patch.dict(
                 os.environ, {"HF_TOKEN": "test-token"}, clear=False
             ), mock.patch.dict(
                 sys.modules, {"huggingface_hub": fake_hub}
-            ), mock.patch.object(
-                MODULE,
-                "require_governed_main",
-                return_value={"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
             ), mock.patch.object(
                 MODULE, "_require_strict_mutation_timer"
             ), mock.patch.object(
@@ -591,6 +1508,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         bundle,
                         SOURCE_SHA,
                         result_path,
+                        authorization_path=authorization_path,
                         failure_output_path=failure_path,
                     )
             self.assertFalse(result_path.exists())
@@ -605,7 +1523,7 @@ class StaticSpaceContractTests(unittest.TestCase):
     def test_deploy_requires_evidence_path_at_call_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with self.assertRaisesRegex(TypeError, "failure_output_path"):
+            with self.assertRaisesRegex(TypeError, "authorization_path"):
                 MODULE.deploy_bundle(root / "bundle", SOURCE_SHA, root / "result.json")
 
     def test_pre_mutation_failure_writes_canonical_evidence(self) -> None:
@@ -615,6 +1533,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             result_path = root / "result.json"
             failure_path = root / "failure.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
             with mock.patch.dict(os.environ, {}, clear=True):
                 with self.assertRaisesRegex(
                     MODULE.ContractError,
@@ -624,6 +1543,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         bundle,
                         SOURCE_SHA,
                         result_path,
+                        authorization_path=authorization_path,
                         failure_output_path=failure_path,
                     )
             failure = json.loads(failure_path.read_text(encoding="utf-8"))
@@ -643,16 +1563,13 @@ class StaticSpaceContractTests(unittest.TestCase):
             failure_path = root / "failure.json"
             result_path.mkdir()
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
             api = FakeHfApi()
             fake_hub = SimpleNamespace(HfApi=lambda token: api)
             with mock.patch.dict(
                 os.environ, {"HF_TOKEN": "test-token"}, clear=False
             ), mock.patch.dict(
                 sys.modules, {"huggingface_hub": fake_hub}
-            ), mock.patch.object(
-                MODULE,
-                "require_governed_main",
-                return_value={"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"},
             ), mock.patch.object(
                 MODULE, "_require_strict_mutation_timer"
             ), mock.patch.object(
@@ -668,6 +1585,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         bundle,
                         SOURCE_SHA,
                         result_path,
+                        authorization_path=authorization_path,
                         failure_output_path=failure_path,
                     )
             failure = json.loads(failure_path.read_text(encoding="utf-8"))
@@ -685,6 +1603,7 @@ class StaticSpaceContractTests(unittest.TestCase):
             result_path = root / "result.json"
             failure_path = root / "failure.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
             with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
                 MODULE,
                 "_write_mutation_failure",
@@ -695,6 +1614,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         bundle,
                         SOURCE_SHA,
                         result_path,
+                        authorization_path=authorization_path,
                         failure_output_path=failure_path,
                     )
             message = str(raised.exception)
@@ -788,6 +1708,22 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertNotIn("raw-secret", diagnostic)
         self.assertIn("<redacted>", diagnostic)
 
+        secret = "hf_secret/with+chars"
+        representations = (
+            f"Authorization: Bearer {secret}",
+            f"headers={{'Authorization': 'Bearer {secret}'}}",
+            "https://example.invalid/read?token=" + urllib.parse.quote(secret, safe=""),
+            f"api_key={secret}",
+        )
+        for representation in representations:
+            with self.subTest(representation=representation):
+                redacted = MODULE._sanitized_diagnostic(
+                    RuntimeError(representation), (secret,)
+                )
+                self.assertNotIn(secret, redacted)
+                self.assertNotIn(urllib.parse.quote(secret, safe=""), redacted)
+                self.assertIn("<redacted>", redacted)
+
     def test_request_timeout_is_capped_by_remaining_deadline(self) -> None:
         with mock.patch.object(MODULE.time, "monotonic", return_value=100.0):
             self.assertEqual(
@@ -823,6 +1759,10 @@ class StaticSpaceContractTests(unittest.TestCase):
             output_path = root / "success.json"
             partial_path = root / "partial.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
+            event_path = root / "event.json"
+            authorization_output_path = root / "post-readback-authorization.json"
+            write_push_event(event_path)
             write_deploy_result(bundle, result_path)
             events: list[str] = []
 
@@ -848,7 +1788,7 @@ class StaticSpaceContractTests(unittest.TestCase):
 
             def authorize(*_args):
                 events.append("guard")
-                return {"status": "AUTHORIZED_EXACT_PROTECTED_MAIN"}
+                return governed_merge_evidence()
 
             with mock.patch.object(MODULE, "_hf_json", side_effect=hf_json):
                 with mock.patch.object(
@@ -868,6 +1808,9 @@ class StaticSpaceContractTests(unittest.TestCase):
                                 10,
                                 MODULE.DEFAULT_CONFIG,
                                 partial_path,
+                                authorization_path=authorization_path,
+                                event_path=event_path,
+                                authorization_output_path=authorization_output_path,
                             )
             self.assertEqual(attestation["status"], "MEASURED")
             self.assertEqual(
@@ -892,6 +1835,10 @@ class StaticSpaceContractTests(unittest.TestCase):
             output_path = root / "success.json"
             partial_path = root / "partial.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
+            event_path = root / "event.json"
+            authorization_output_path = root / "post-readback-authorization.json"
+            write_push_event(event_path)
             write_deploy_result(bundle, result_path)
 
             def hf_json(url: str, _deadline: float):
@@ -930,6 +1877,9 @@ class StaticSpaceContractTests(unittest.TestCase):
                                     10,
                                     MODULE.DEFAULT_CONFIG,
                                     partial_path,
+                                    authorization_path=authorization_path,
+                                    event_path=event_path,
+                                    authorization_output_path=authorization_output_path,
                                 )
             partial = json.loads(partial_path.read_text(encoding="utf-8"))
             self.assertEqual(partial["status"], "PARTIAL_AFTER_MUTATION")
@@ -947,6 +1897,10 @@ class StaticSpaceContractTests(unittest.TestCase):
             output_path = root / "success.json"
             partial_path = root / "partial.json"
             MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
+            event_path = root / "event.json"
+            authorization_output_path = root / "post-readback-authorization.json"
+            write_push_event(event_path)
             write_deploy_result(bundle, result_path)
             with mock.patch.object(
                 MODULE,
@@ -964,6 +1918,9 @@ class StaticSpaceContractTests(unittest.TestCase):
                         1,
                         MODULE.DEFAULT_CONFIG,
                         partial_path,
+                        authorization_path=authorization_path,
+                        event_path=event_path,
+                        authorization_output_path=authorization_output_path,
                     )
             partial = json.loads(partial_path.read_text(encoding="utf-8"))
             self.assertEqual(partial["hf_revision"], TARGET_SHA)
@@ -1000,8 +1957,8 @@ class StaticSpaceContractTests(unittest.TestCase):
             }
             measurement_path.write_bytes(MODULE.canonical_json(measurement))
             cases = (
-                ("failure", "skipped", "", "success_evidence_upload"),
-                ("success", "failure", "", "oidc_attestation"),
+                ("failure", "skipped", "", "measurement_evidence_upload"),
+            ("success", "failure", "", "oidc_attestation"),
                 ("success", "success", "terminal_evidence_upload", "terminal_evidence_upload"),
             )
             for success_evidence, oidc, forced, expected_stage in cases:
@@ -1033,6 +1990,74 @@ class StaticSpaceContractTests(unittest.TestCase):
                         workflow_failure_path.read_bytes(),
                         MODULE.canonical_json(failure),
                     )
+
+    def test_upstream_stage_outcomes_are_classified_before_mutation(self) -> None:
+        cases = (
+            ({"authorization_outcome": "failure"}, "governance_authorization"),
+            (
+                {"authorization_evidence_outcome": "failure"},
+                "governance_authorization_evidence",
+            ),
+            ({"publisher_input_outcome": "failure"}, "publisher_input"),
+            ({"publisher_environment_outcome": "failure"}, "publisher_environment"),
+            ({"publisher_freshness_outcome": "failure"}, "publisher_freshness"),
+            ({"publisher_evidence_outcome": "failure"}, "publisher_evidence_upload"),
+            (
+                {"publisher_evidence_download_outcome": "failure"},
+                "publisher_evidence_download",
+            ),
+            (
+                {"measurement_evidence_download_outcome": "failure"},
+                "measurement_evidence_download",
+            ),
+            ({"measurement_hardening_outcome": "failure"}, "measurement_hardening"),
+            ({"measurement_input_outcome": "failure"}, "measurement_input"),
+            (
+                {"measurement_rebind_outcome": "failure"},
+                "measurement_executable_rebind",
+            ),
+            (
+                {"measurement_publisher_evidence_outcome": "failure"},
+                "measurement_publisher_evidence_download",
+            ),
+            (
+                {"measurement_environment_outcome": "failure"},
+                "measurement_environment",
+            ),
+            (
+                {"attestation_hardening_outcome": "failure"},
+                "attestation_hardening",
+            ),
+            (
+                {"attestation_checkout_outcome": "failure"},
+                "attestation_checkout",
+            ),
+            (
+                {"attestation_environment_outcome": "failure"},
+                "attestation_environment",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for options, expected_stage in cases:
+                with self.subTest(stage=expected_stage):
+                    failure = MODULE.synthesize_workflow_outcome(
+                        SOURCE_SHA,
+                        root / "missing-result.json",
+                        root / "missing-measurement.json",
+                        root / "missing-mutation.json",
+                        root / "missing-partial.json",
+                        root / "receipt.json",
+                        root / "workflow-failure.json",
+                        "success",
+                        "success",
+                        "success",
+                        "success",
+                        **options,
+                    )
+                    self.assertEqual(failure["failure_stage"], expected_stage)
+                    self.assertFalse(failure["deployment_success"])
+                    self.assertFalse((root / "receipt.json").exists())
 
     def test_successful_oidc_outcome_mints_exact_measurement_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
