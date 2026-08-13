@@ -2378,12 +2378,33 @@ class WorkflowBoundaryTests(unittest.TestCase):
         }
         self.assertEqual(
             steps["Download exact publisher outcome"]["if"],
-            "needs.deploy.result == 'success' && needs.deploy.outputs.publication-artifact-name != ''",
+            "needs.deploy.outputs.publication-artifact-name != ''",
         )
         self.assertEqual(
             steps["Download exact public measurement"]["if"],
-            "needs.measure.result == 'success' && needs.measure.outputs.measurement-artifact-name != ''",
+            "needs.measure.outputs.measurement-artifact-name != ''",
         )
+
+    def test_attestation_downloads_preserve_named_failure_evidence(self) -> None:
+        steps = {
+            step["name"]: step
+            for step in self.workflow["jobs"]["attest"]["steps"]
+        }
+        expected_channels = {
+            "Download exact publisher outcome": (
+                "needs.deploy.outputs.publication-artifact-name"
+            ),
+            "Download exact public measurement": (
+                "needs.measure.outputs.measurement-artifact-name"
+            ),
+        }
+        for name, channel in expected_channels.items():
+            with self.subTest(step=name):
+                step = steps[name]
+                self.assertEqual(step["if"], f"{channel} != ''")
+                self.assertEqual(step["with"]["name"], "${{ " + channel + " }}")
+                self.assertNotIn(".result", step["if"])
+                self.assertIs(step["continue-on-error"], True)
 
     def test_publish_path_is_bound_without_an_unset_step_environment(self) -> None:
         steps = {
