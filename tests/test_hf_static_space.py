@@ -2378,11 +2378,11 @@ class WorkflowBoundaryTests(unittest.TestCase):
         }
         self.assertEqual(
             steps["Download exact publisher outcome"]["if"],
-            "needs.deploy.outputs.publication-artifact-name != ''",
+            "always() && needs.deploy.outputs.publication-artifact-name != ''",
         )
         self.assertEqual(
             steps["Download exact public measurement"]["if"],
-            "needs.measure.outputs.measurement-artifact-name != ''",
+            "always() && needs.measure.outputs.measurement-artifact-name != ''",
         )
 
     def test_attestation_downloads_preserve_named_failure_evidence(self) -> None:
@@ -2401,7 +2401,7 @@ class WorkflowBoundaryTests(unittest.TestCase):
         for name, channel in expected_channels.items():
             with self.subTest(step=name):
                 step = steps[name]
-                self.assertEqual(step["if"], f"{channel} != ''")
+                self.assertEqual(step["if"], f"always() && {channel} != ''")
                 self.assertEqual(step["with"]["name"], "${{ " + channel + " }}")
                 self.assertNotIn(".result", step["if"])
                 self.assertIs(step["continue-on-error"], True)
