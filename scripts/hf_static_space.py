@@ -1672,6 +1672,7 @@ def deploy_bundle(
         before_sha = exact_sha(before.sha, "observed Hugging Face parent revision")
         state["previous_hf_revision"] = before_sha
         _require_strict_mutation_timer()
+        freshness_output_path.unlink(missing_ok=True)
         require_public_main_fresh(source_sha, freshness_output_path, config_path)
         state["upload_call_entered"] = True
         upload_transport = "RETURNED_AUTHORITATIVE_REVISION"

@@ -1505,6 +1505,46 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertEqual(result["authorization"], governed_merge_evidence())
             self.assertFalse(failure_path.exists())
 
+    def test_final_freshness_failure_removes_stale_evidence_before_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            failure_path = root / "failure.json"
+            freshness_path = root / "github-main-freshness.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
+            freshness_path.write_bytes(
+                MODULE.canonical_json({"status": "PUBLIC_MAIN_FRESH"})
+            )
+            api = FakeHfApi()
+            fake_hub = SimpleNamespace(HfApi=lambda token: api)
+            with mock.patch.dict(
+                os.environ, {"HF_TOKEN": "test-token"}, clear=False
+            ), mock.patch.dict(
+                sys.modules, {"huggingface_hub": fake_hub}
+            ), mock.patch.object(
+                MODULE, "_require_strict_mutation_timer"
+            ), mock.patch.object(
+                MODULE,
+                "require_public_main_fresh",
+                side_effect=MODULE.ContractError("public main moved"),
+            ):
+                with self.assertRaises(MODULE.ContractError):
+                    MODULE.deploy_bundle(
+                        bundle,
+                        SOURCE_SHA,
+                        result_path,
+                        authorization_path=authorization_path,
+                        failure_output_path=failure_path,
+                        freshness_output_path=freshness_path,
+                    )
+            self.assertFalse(freshness_path.exists())
+            self.assertIsNone(api.upload_kwargs)
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            self.assertEqual(failure["status"], "FAILED_BEFORE_MUTATION")
+            self.assertFalse(failure["upload_call_entered"])
+
     def test_deploy_stale_parent_fails_without_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

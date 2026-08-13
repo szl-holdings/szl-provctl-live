@@ -352,7 +352,7 @@ jobs:
             PYTHONIOENCODING="utf-8" \
             "$PUBLISHER_PYTHON" -I "$RUNNER_TEMP/publisher-input/scripts/hf_static_space.py" fresh-main \
             --source-sha "$SOURCE_SHA" \
-            --output "$RUNNER_TEMP/publication-evidence/github-main-freshness.json"
+            --output "$RUNNER_TEMP/publication-evidence/github-main-preflight-freshness.json"
       - name: Classify public-main freshness failure before mutation
         if: always() && steps.publisher-rebind.outcome == 'success' && steps.publisher-environment.outcome == 'success' && steps.publisher-freshness.outcome != 'success'
         run: |
