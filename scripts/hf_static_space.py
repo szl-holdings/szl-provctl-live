@@ -452,6 +452,13 @@ def require_public_main_fresh(
     commit_url = (
         f"{PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{source_sha}"
     )
+    commit_document = _request_json(commit_url)
+    if (
+        not isinstance(commit_document, dict)
+        or commit_document.get("sha") != source_sha
+        or commit_document.get("url") != commit_url
+    ):
+        raise ContractError("public main commit response is not exact")
     ref_document = _request_json(ref_url)
     ref_object = ref_document.get("object") if isinstance(ref_document, dict) else None
     if (
@@ -463,13 +470,6 @@ def require_public_main_fresh(
         or ref_object.get("url") != commit_url
     ):
         raise ContractError("public main ref does not identify the exact source revision")
-    commit_document = _request_json(commit_url)
-    if (
-        not isinstance(commit_document, dict)
-        or commit_document.get("sha") != source_sha
-        or commit_document.get("url") != commit_url
-    ):
-        raise ContractError("public main commit response is not exact")
     evidence = {
         "schema": "szl.github-public-main-freshness/v1",
         "status": "PUBLIC_MAIN_FRESH",
@@ -1630,6 +1630,7 @@ def deploy_bundle(
     *,
     authorization_path: Path,
     failure_output_path: Path,
+    freshness_output_path: Path,
     mutation_state: dict[str, object] | None = None,
 ) -> dict:
     requested_source_sha = str(source_sha or "")
@@ -1671,6 +1672,8 @@ def deploy_bundle(
         before_sha = exact_sha(before.sha, "observed Hugging Face parent revision")
         state["previous_hf_revision"] = before_sha
         _require_strict_mutation_timer()
+        freshness_output_path.unlink(missing_ok=True)
+        require_public_main_fresh(source_sha, freshness_output_path, config_path)
         state["upload_call_entered"] = True
         upload_transport = "RETURNED_AUTHORITATIVE_REVISION"
         try:
@@ -2199,7 +2202,11 @@ def synthesize_workflow_outcome(
     *,
     authorization_outcome: str = "success",
     authorization_evidence_outcome: str = "success",
+    bundle_outcome: str = "success",
     publisher_input_outcome: str = "success",
+    publisher_digests_outcome: str = "success",
+    publisher_input_evidence_outcome: str = "success",
+    publisher_input_download_outcome: str = "success",
     publisher_rebind_outcome: str = "success",
     publisher_environment_outcome: str = "success",
     publisher_freshness_outcome: str = "success",
@@ -2238,7 +2245,11 @@ def synthesize_workflow_outcome(
     outcomes = {
         "governance_authorization": authorization_outcome,
         "governance_authorization_evidence": authorization_evidence_outcome,
-        "publisher_input": publisher_input_outcome,
+        "publisher_bundle": bundle_outcome,
+        "publisher_input_staging": publisher_input_outcome,
+        "publisher_input_digest_binding": publisher_digests_outcome,
+        "publisher_input_evidence_upload": publisher_input_evidence_outcome,
+        "publisher_input_download": publisher_input_download_outcome,
         "publisher_executable_rebind": publisher_rebind_outcome,
         "publisher_environment": publisher_environment_outcome,
         "publisher_freshness": publisher_freshness_outcome,
@@ -2357,6 +2368,7 @@ def main() -> int:
     deploy.add_argument("--result", type=Path, required=True)
     deploy.add_argument("--authorization", type=Path, required=True)
     deploy.add_argument("--failure-output", type=Path, required=True)
+    deploy.add_argument("--freshness-output", type=Path, required=True)
     attest = subparsers.add_parser("attest")
     attest.add_argument("--bundle", type=Path, required=True)
     attest.add_argument("--source-sha", required=True)
@@ -2386,9 +2398,13 @@ def main() -> int:
     outcome.add_argument("--measurement-outcome", required=True)
     outcome.add_argument("--success-evidence-outcome", required=True)
     outcome.add_argument("--oidc-outcome", required=True)
-    outcome.add_argument("--authorization-outcome", default="success")
-    outcome.add_argument("--authorization-evidence-outcome", default="success")
-    outcome.add_argument("--publisher-input-outcome", default="success")
+    outcome.add_argument("--authorization-outcome", required=True)
+    outcome.add_argument("--authorization-evidence-outcome", required=True)
+    outcome.add_argument("--bundle-outcome", required=True)
+    outcome.add_argument("--publisher-input-outcome", required=True)
+    outcome.add_argument("--publisher-digests-outcome", required=True)
+    outcome.add_argument("--publisher-input-evidence-outcome", required=True)
+    outcome.add_argument("--publisher-input-download-outcome", required=True)
     outcome.add_argument("--publisher-rebind-outcome", default="success")
     outcome.add_argument("--publisher-environment-outcome", default="success")
     outcome.add_argument("--publisher-freshness-outcome", default="success")
@@ -2431,6 +2447,7 @@ def main() -> int:
             args.config,
             authorization_path=args.authorization,
             failure_output_path=args.failure_output,
+            freshness_output_path=args.freshness_output,
         )
     elif args.command == "attest":
         value = attest_bundle(
@@ -2470,7 +2487,11 @@ def main() -> int:
             args.config,
             authorization_outcome=args.authorization_outcome,
             authorization_evidence_outcome=args.authorization_evidence_outcome,
+            bundle_outcome=args.bundle_outcome,
             publisher_input_outcome=args.publisher_input_outcome,
+            publisher_digests_outcome=args.publisher_digests_outcome,
+            publisher_input_evidence_outcome=args.publisher_input_evidence_outcome,
+            publisher_input_download_outcome=args.publisher_input_download_outcome,
             publisher_rebind_outcome=args.publisher_rebind_outcome,
             publisher_environment_outcome=args.publisher_environment_outcome,
             publisher_freshness_outcome=args.publisher_freshness_outcome,

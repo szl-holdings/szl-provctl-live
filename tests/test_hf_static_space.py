@@ -1001,11 +1001,11 @@ class StaticSpaceContractTests(unittest.TestCase):
             f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{SOURCE_SHA}"
         )
         responses = [
+            {"sha": SOURCE_SHA, "url": commit_url},
             {
                 "ref": "refs/heads/main",
                 "object": {"type": "commit", "sha": SOURCE_SHA, "url": commit_url},
             },
-            {"sha": SOURCE_SHA, "url": commit_url},
         ]
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "github-main-freshness.json"
@@ -1015,7 +1015,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                 evidence = MODULE.require_public_main_fresh(SOURCE_SHA, output)
             self.assertEqual(
                 request_json.call_args_list,
-                [mock.call(ref_url), mock.call(commit_url)],
+                [mock.call(commit_url), mock.call(ref_url)],
             )
             self.assertEqual(evidence["schema"], "szl.github-public-main-freshness/v1")
             self.assertEqual(evidence["status"], "PUBLIC_MAIN_FRESH")
@@ -1028,12 +1028,16 @@ class StaticSpaceContractTests(unittest.TestCase):
         commit_url = (
             f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{SOURCE_SHA}"
         )
+        valid_commit = {"sha": SOURCE_SHA, "url": commit_url}
         variants = (
-            [{"ref": "refs/heads/main", "object": {"type": "commit", "sha": TARGET_SHA, "url": commit_url}}],
-            [{"ref": "refs/heads/main", "object": {"type": "tag", "sha": SOURCE_SHA, "url": commit_url}}],
+            [{"sha": TARGET_SHA, "url": commit_url}],
             [
-                {"ref": "refs/heads/main", "object": {"type": "commit", "sha": SOURCE_SHA, "url": commit_url}},
-                {"sha": TARGET_SHA, "url": commit_url},
+                valid_commit,
+                {"ref": "refs/heads/main", "object": {"type": "commit", "sha": TARGET_SHA, "url": commit_url}},
+            ],
+            [
+                valid_commit,
+                {"ref": "refs/heads/main", "object": {"type": "tag", "sha": SOURCE_SHA, "url": commit_url}},
             ],
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -1372,8 +1376,11 @@ class StaticSpaceContractTests(unittest.TestCase):
         self.assertGreater(len(artifact_steps), 0)
         for step in artifact_steps:
             artifact_name = step["with"]["name"]
-            self.assertIn("${{ github.sha }}", artifact_name)
-            self.assertIn("${{ github.run_attempt }}", artifact_name)
+            if "actions/upload-artifact@" in step["uses"]:
+                self.assertIn("${{ github.sha }}", artifact_name)
+                self.assertIn("${{ github.run_attempt }}", artifact_name)
+            else:
+                self.assertTrue(artifact_name.startswith("${{ needs."))
 
         measurement_rebind = measure_steps["measurement-rebind"]
         self.assertEqual(
@@ -1446,11 +1453,31 @@ class StaticSpaceContractTests(unittest.TestCase):
             events: list[str] = []
             api = FakeHfApi(events=events)
             fake_hub = SimpleNamespace(HfApi=lambda token: api)
+            repository = MODULE.load_config()["source_repository"]
+            commit_url = (
+                f"{MODULE.PUBLIC_GITHUB_API_ROOT}/repos/{repository}/git/commits/{SOURCE_SHA}"
+            )
+
+            def public_main_response(url: str) -> dict:
+                if url == commit_url:
+                    events.append("github-commit")
+                    return {"sha": SOURCE_SHA, "url": commit_url}
+                events.append("github-main")
+                return {
+                    "ref": "refs/heads/main",
+                    "object": {
+                        "type": "commit",
+                        "sha": SOURCE_SHA,
+                        "url": commit_url,
+                    },
+                }
 
             with mock.patch.dict(
                 os.environ, {"HF_TOKEN": "test-token"}, clear=False
             ), mock.patch.dict(
                 sys.modules, {"huggingface_hub": fake_hub}
+            ), mock.patch.object(
+                MODULE, "_request_json", side_effect=public_main_response
             ), mock.patch.object(
                 MODULE, "_require_strict_mutation_timer"
             ), mock.patch.object(
@@ -1464,6 +1491,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                     result_path,
                     authorization_path=authorization_path,
                     failure_output_path=failure_path,
+                    freshness_output_path=root / "github-main-freshness.json",
                 )
             assert api.upload_kwargs is not None
             self.assertEqual(api.upload_kwargs["parent_commit"], PARENT_SHA)
@@ -1471,9 +1499,51 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertEqual(Path(api.upload_kwargs["folder_path"]), bundle)
             self.assertEqual(result["previous_hf_revision"], PARENT_SHA)
             self.assertEqual(result["hf_revision"], TARGET_SHA)
-            self.assertEqual(events, ["parent", "upload"])
+            self.assertEqual(
+                events, ["parent", "github-commit", "github-main", "upload"]
+            )
             self.assertEqual(result["authorization"], governed_merge_evidence())
             self.assertFalse(failure_path.exists())
+
+    def test_final_freshness_failure_removes_stale_evidence_before_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            result_path = root / "result.json"
+            failure_path = root / "failure.json"
+            freshness_path = root / "github-main-freshness.json"
+            MODULE.build_bundle(bundle, SOURCE_SHA)
+            authorization_path = write_authorization(root)
+            freshness_path.write_bytes(
+                MODULE.canonical_json({"status": "PUBLIC_MAIN_FRESH"})
+            )
+            api = FakeHfApi()
+            fake_hub = SimpleNamespace(HfApi=lambda token: api)
+            with mock.patch.dict(
+                os.environ, {"HF_TOKEN": "test-token"}, clear=False
+            ), mock.patch.dict(
+                sys.modules, {"huggingface_hub": fake_hub}
+            ), mock.patch.object(
+                MODULE, "_require_strict_mutation_timer"
+            ), mock.patch.object(
+                MODULE,
+                "require_public_main_fresh",
+                side_effect=MODULE.ContractError("public main moved"),
+            ):
+                with self.assertRaises(MODULE.ContractError):
+                    MODULE.deploy_bundle(
+                        bundle,
+                        SOURCE_SHA,
+                        result_path,
+                        authorization_path=authorization_path,
+                        failure_output_path=failure_path,
+                        freshness_output_path=freshness_path,
+                    )
+            self.assertFalse(freshness_path.exists())
+            self.assertIsNone(api.upload_kwargs)
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            self.assertEqual(failure["status"], "FAILED_BEFORE_MUTATION")
+            self.assertFalse(failure["upload_call_entered"])
 
     def test_deploy_stale_parent_fails_without_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1489,6 +1559,8 @@ class StaticSpaceContractTests(unittest.TestCase):
                 os.environ, {"HF_TOKEN": "test-token"}, clear=False
             ), mock.patch.dict(
                 sys.modules, {"huggingface_hub": fake_hub}
+            ), mock.patch.object(
+                MODULE, "require_public_main_fresh", return_value={}
             ), mock.patch.object(
                 MODULE, "_require_strict_mutation_timer"
             ), mock.patch.object(
@@ -1510,6 +1582,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         result_path,
                         authorization_path=authorization_path,
                         failure_output_path=failure_path,
+                        freshness_output_path=root / "github-main-freshness.json",
                     )
             self.assertFalse(result_path.exists())
             failure = json.loads(failure_path.read_text(encoding="utf-8"))
@@ -1545,6 +1618,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         result_path,
                         authorization_path=authorization_path,
                         failure_output_path=failure_path,
+                        freshness_output_path=root / "github-main-freshness.json",
                     )
             failure = json.loads(failure_path.read_text(encoding="utf-8"))
             self.assertEqual(failure["status"], "FAILED_BEFORE_MUTATION")
@@ -1571,6 +1645,8 @@ class StaticSpaceContractTests(unittest.TestCase):
             ), mock.patch.dict(
                 sys.modules, {"huggingface_hub": fake_hub}
             ), mock.patch.object(
+                MODULE, "require_public_main_fresh", return_value={}
+            ), mock.patch.object(
                 MODULE, "_require_strict_mutation_timer"
             ), mock.patch.object(
                 MODULE,
@@ -1587,6 +1663,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         result_path,
                         authorization_path=authorization_path,
                         failure_output_path=failure_path,
+                        freshness_output_path=root / "github-main-freshness.json",
                     )
             failure = json.loads(failure_path.read_text(encoding="utf-8"))
             self.assertEqual(failure["status"], "PARTIAL_AFTER_MUTATION")
@@ -1616,6 +1693,7 @@ class StaticSpaceContractTests(unittest.TestCase):
                         result_path,
                         authorization_path=authorization_path,
                         failure_output_path=failure_path,
+                        freshness_output_path=root / "github-main-freshness.json",
                     )
             message = str(raised.exception)
             self.assertIn("mandatory machine-readable evidence could not be persisted", message)
@@ -1998,7 +2076,20 @@ class StaticSpaceContractTests(unittest.TestCase):
                 {"authorization_evidence_outcome": "failure"},
                 "governance_authorization_evidence",
             ),
-            ({"publisher_input_outcome": "failure"}, "publisher_input"),
+            ({"bundle_outcome": "failure"}, "publisher_bundle"),
+            ({"publisher_input_outcome": "failure"}, "publisher_input_staging"),
+            (
+                {"publisher_digests_outcome": "failure"},
+                "publisher_input_digest_binding",
+            ),
+            (
+                {"publisher_input_evidence_outcome": "failure"},
+                "publisher_input_evidence_upload",
+            ),
+            (
+                {"publisher_input_download_outcome": "failure"},
+                "publisher_input_download",
+            ),
             ({"publisher_environment_outcome": "failure"}, "publisher_environment"),
             ({"publisher_freshness_outcome": "failure"}, "publisher_freshness"),
             ({"publisher_evidence_outcome": "failure"}, "publisher_evidence_upload"),
@@ -2217,6 +2308,175 @@ class StaticSpaceContractTests(unittest.TestCase):
             self.assertFalse(failure["receipt_minted"])
             self.assertFalse(failure["deployment_success"])
             self.assertFalse(receipt_path.exists())
+
+
+class WorkflowBoundaryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / "hf-static-space.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_every_artifact_channel_is_unique_per_run_attempt(self) -> None:
+        artifact_steps = [
+            (job_id, step)
+            for job_id, job in self.workflow["jobs"].items()
+            for step in job.get("steps", [])
+            if "actions/upload-artifact@" in str(step.get("uses", ""))
+            or "actions/download-artifact@" in str(step.get("uses", ""))
+        ]
+        self.assertEqual(len(artifact_steps), 11)
+        uploads = [
+            (job_id, step)
+            for job_id, step in artifact_steps
+            if "actions/upload-artifact@" in str(step.get("uses", ""))
+        ]
+        downloads = {
+            (job_id, step["name"]): step["with"]["name"]
+            for job_id, step in artifact_steps
+            if "actions/download-artifact@" in str(step.get("uses", ""))
+        }
+        self.assertEqual(len(uploads), 6)
+        for job_id, step in uploads:
+            with self.subTest(job=job_id, step=step["name"]):
+                self.assertIn(
+                    "${{ github.run_attempt }}",
+                    step["with"]["name"],
+                )
+        self.assertEqual(
+            downloads,
+            {
+                (
+                    "deploy",
+                    "Download exact authorized publisher input",
+                ): "${{ needs.authorize.outputs.publisher-input-artifact-name }}",
+                (
+                    "measure",
+                    "Download exact authorized publisher input",
+                ): "${{ needs.authorize.outputs.publisher-input-artifact-name }}",
+                (
+                    "measure",
+                    "Download exact publisher outcome",
+                ): "${{ needs.deploy.outputs.publication-artifact-name }}",
+                (
+                    "attest",
+                    "Download exact publisher outcome",
+                ): "${{ needs.deploy.outputs.publication-artifact-name }}",
+                (
+                    "attest",
+                    "Download exact public measurement",
+                ): "${{ needs.measure.outputs.measurement-artifact-name }}",
+            },
+        )
+
+    def test_attestation_downloads_reject_missing_producer_channels(self) -> None:
+        steps = {
+            step["name"]: step
+            for step in self.workflow["jobs"]["attest"]["steps"]
+        }
+        self.assertEqual(
+            steps["Download exact publisher outcome"]["if"],
+            "always() && needs.deploy.outputs.publication-artifact-name != ''",
+        )
+        self.assertEqual(
+            steps["Download exact public measurement"]["if"],
+            "always() && needs.measure.outputs.measurement-artifact-name != ''",
+        )
+
+    def test_attestation_downloads_preserve_named_failure_evidence(self) -> None:
+        steps = {
+            step["name"]: step
+            for step in self.workflow["jobs"]["attest"]["steps"]
+        }
+        expected_channels = {
+            "Download exact publisher outcome": (
+                "needs.deploy.outputs.publication-artifact-name"
+            ),
+            "Download exact public measurement": (
+                "needs.measure.outputs.measurement-artifact-name"
+            ),
+        }
+        for name, channel in expected_channels.items():
+            with self.subTest(step=name):
+                step = steps[name]
+                self.assertEqual(step["if"], f"always() && {channel} != ''")
+                self.assertEqual(step["with"]["name"], "${{ " + channel + " }}")
+                self.assertNotIn(".result", step["if"])
+                self.assertIs(step["continue-on-error"], True)
+
+    def test_publish_path_is_bound_without_an_unset_step_environment(self) -> None:
+        steps = {
+            step["name"]: step
+            for step in self.workflow["jobs"]["deploy"]["steps"]
+        }
+        environment = steps[
+            "Install pinned Hugging Face client without repository credentials"
+        ]
+        self.assertEqual(
+            environment["env"]["PUBLISHER_VENV"],
+            "${{ runner.temp }}/hf-publisher-venv",
+        )
+        for name in (
+            "Reconfirm public main at exact source revision without credentials",
+            "Publish exact bundle with only the Hugging Face credential",
+        ):
+            with self.subTest(step=name):
+                command = steps[name]["run"]
+                self.assertIn(
+                    'PATH="$RUNNER_TEMP/hf-publisher-venv/bin:/usr/bin:/bin"',
+                    command,
+                )
+                self.assertNotIn('PATH="$PUBLISHER_VENV/bin', command)
+
+    def test_terminal_synthesis_preserves_authorize_stage_outcomes(self) -> None:
+        steps = {
+            step["name"]: step
+            for step in self.workflow["jobs"]["attest"]["steps"]
+        }
+        synthesis = "\n".join(
+            (
+                steps[
+                    "Synthesize final receipt or exact workflow-stage failure"
+                ]["run"],
+                steps["Synthesize terminal artifact-upload failure"]["run"],
+            )
+        )
+        terminal = steps["Require terminal governed success"]["run"]
+        outcomes = {
+            "--bundle-outcome": "${{ needs.authorize.outputs.bundle-outcome }}",
+            "--publisher-input-outcome": (
+                "${{ needs.authorize.outputs.publisher-input-outcome }}"
+            ),
+            "--publisher-digests-outcome": (
+                "${{ needs.authorize.outputs.publisher-digests-outcome }}"
+            ),
+            "--publisher-input-evidence-outcome": (
+                "${{ needs.authorize.outputs.publisher-input-evidence-outcome }}"
+            ),
+            "--publisher-input-download-outcome": (
+                "${{ needs.deploy.outputs.publisher-input-outcome }}"
+            ),
+        }
+        for argument, expression in outcomes.items():
+            with self.subTest(argument=argument):
+                self.assertEqual(
+                    synthesis.count(f'{argument} "{expression}"'),
+                    2,
+                )
+                self.assertIn(f'test "{expression}" = "success"', terminal)
+
+        publish = steps.get("Publish exact bundle with only the Hugging Face credential")
+        if publish is None:
+            publish = {
+                step["name"]: step
+                for step in self.workflow["jobs"]["deploy"]["steps"]
+            }["Publish exact bundle with only the Hugging Face credential"]
+        self.assertIn(
+            '--freshness-output "$RUNNER_TEMP/publication-evidence/github-main-freshness.json"',
+            publish["run"],
+        )
 
 
 if __name__ == "__main__":
