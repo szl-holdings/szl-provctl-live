@@ -671,6 +671,109 @@ def _run_pull_is_exact(
     )
 
 
+def _exact_head_pull_binding(
+    associated: list[dict],
+    repository: str,
+    repository_id: int,
+    pull_evidence: dict,
+) -> dict[str, object]:
+    if len(associated) != 1:
+        raise ContractError(
+            "exact pull-request head is not bound to one unambiguous pull request"
+        )
+    pull = associated[0]
+    head = pull.get("head") if isinstance(pull, dict) else None
+    base = pull.get("base") if isinstance(pull, dict) else None
+    if (
+        not isinstance(pull, dict)
+        or pull.get("id") != pull_evidence.get("id")
+        or pull.get("number") != pull_evidence.get("number")
+        or pull.get("state") != "closed"
+        or pull.get("merged_at") != pull_evidence.get("merged_at")
+        or pull.get("merge_commit_sha") != pull_evidence.get("merge_revision")
+        or not isinstance(base, dict)
+        or base.get("ref") != "main"
+        or base.get("sha") != pull_evidence.get("base_revision")
+        or not isinstance(base.get("repo"), dict)
+        or base["repo"].get("full_name") != repository
+        or base["repo"].get("id") != repository_id
+        or not isinstance(head, dict)
+        or head.get("ref") != pull_evidence.get("head_ref")
+        or head.get("sha") != pull_evidence.get("head_revision")
+        or not isinstance(head.get("repo"), dict)
+        or head["repo"].get("full_name") != repository
+        or head["repo"].get("id") != repository_id
+    ):
+        raise ContractError("exact pull-request head association is not exact")
+    return {
+        "base_revision": pull_evidence["base_revision"],
+        "head_ref": pull_evidence["head_ref"],
+        "head_revision": pull_evidence["head_revision"],
+        "merge_revision": pull_evidence["merge_revision"],
+        "pull_request_id": pull_evidence["id"],
+        "pull_request_number": pull_evidence["number"],
+        "repository": {"full_name": repository, "id": repository_id},
+    }
+
+
+def _head_pull_binding_is_exact(
+    binding: object,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+) -> bool:
+    bound_repository = binding.get("repository") if isinstance(binding, dict) else None
+    return (
+        isinstance(binding, dict)
+        and binding.get("pull_request_number") == pull_number
+        and type(binding.get("pull_request_id")) is int
+        and binding["pull_request_id"] > 0
+        and binding.get("base_revision") == base_sha
+        and binding.get("head_ref") == head_ref
+        and binding.get("head_revision") == head_sha
+        and isinstance(binding.get("merge_revision"), str)
+        and HEX40.fullmatch(binding["merge_revision"]) is not None
+        and isinstance(bound_repository, dict)
+        and bound_repository.get("full_name") == repository
+        and bound_repository.get("id") == repository_id
+    )
+
+
+def _workflow_run_pull_is_exact(
+    pull_requests: object,
+    independent_binding: object,
+    repository: str,
+    repository_id: int,
+    pull_number: int,
+    base_sha: str,
+    head_ref: str,
+    head_sha: str,
+) -> bool:
+    if not _head_pull_binding_is_exact(
+        independent_binding,
+        repository,
+        repository_id,
+        pull_number,
+        base_sha,
+        head_ref,
+        head_sha,
+    ):
+        return False
+    if pull_requests == []:
+        return True
+    return _run_pull_is_exact(
+        pull_requests,
+        repository_id,
+        pull_number,
+        base_sha,
+        head_ref,
+        head_sha,
+    )
+
+
 def _run_is_exact(
     row: object,
     repository: str,
@@ -679,6 +782,7 @@ def _run_is_exact(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    independent_binding: dict[str, object],
     workflow_id: int,
     workflow_name: str,
     workflow_path: str,
@@ -693,8 +797,10 @@ def _run_is_exact(
         and isinstance(row.get("repository"), dict)
         and row["repository"].get("full_name") == repository
         and row["repository"].get("id") == repository_id
-        and _run_pull_is_exact(
+        and _workflow_run_pull_is_exact(
             row.get("pull_requests"),
+            independent_binding,
+            repository,
             repository_id,
             pull_number,
             base_sha,
@@ -712,6 +818,7 @@ def _select_exact_pull_request_workflow(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    independent_binding: dict[str, object],
     *,
     workflow_id: int,
     workflow_name: str,
@@ -729,6 +836,7 @@ def _select_exact_pull_request_workflow(
             base_sha,
             head_ref,
             head_sha,
+            independent_binding,
             workflow_id,
             workflow_name,
             workflow_path,
@@ -765,6 +873,7 @@ def _bind_workflow_attempt(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    independent_binding: dict[str, object],
     *,
     workflow_id: int,
     workflow_name: str,
@@ -786,6 +895,7 @@ def _bind_workflow_attempt(
             base_sha,
             head_ref,
             head_sha,
+            independent_binding,
             workflow_id,
             workflow_name,
             workflow_path,
@@ -898,6 +1008,7 @@ def _require_exact_pull_request_workflow(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    independent_binding: dict[str, object],
     *,
     workflow_id: int,
     workflow_name: str,
@@ -913,6 +1024,7 @@ def _require_exact_pull_request_workflow(
         base_sha,
         head_ref,
         head_sha,
+        independent_binding,
         workflow_id=workflow_id,
         workflow_name=workflow_name,
         workflow_path=workflow_path,
@@ -928,6 +1040,7 @@ def _require_exact_pull_request_workflow(
         base_sha,
         head_ref,
         head_sha,
+        independent_binding,
         workflow_id=workflow_id,
         workflow_name=workflow_name,
         workflow_path=workflow_path,
@@ -946,6 +1059,7 @@ def _require_release_workflow(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    independent_binding: dict[str, object],
 ) -> tuple[dict[str, object], list[dict]]:
     return _require_exact_pull_request_workflow(
         rows,
@@ -957,6 +1071,7 @@ def _require_release_workflow(
         base_sha,
         head_ref,
         head_sha,
+        independent_binding,
         workflow_id=TARGET_RELEASE_WORKFLOW_IDS[repository],
         workflow_name=RELEASE_WORKFLOW_NAME,
         workflow_path=RELEASE_WORKFLOW_PATH,
@@ -975,6 +1090,7 @@ def _require_boundary_workflow(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    independent_binding: dict[str, object],
 ) -> tuple[dict[str, object], list[dict]]:
     return _require_exact_pull_request_workflow(
         rows,
@@ -986,6 +1102,7 @@ def _require_boundary_workflow(
         base_sha,
         head_ref,
         head_sha,
+        independent_binding,
         workflow_id=TARGET_REQUIRED_WORKFLOW_IDS[repository],
         workflow_name=REQUIRED_WORKFLOW_NAME,
         workflow_path=REQUIRED_WORKFLOW_PATH,
@@ -1057,6 +1174,7 @@ def _require_latest_run_still_exact(
     base_sha: str,
     head_ref: str,
     head_sha: str,
+    independent_binding: dict[str, object],
     evidence: dict,
 ) -> None:
     current = _request_json(
@@ -1071,6 +1189,7 @@ def _require_latest_run_still_exact(
             base_sha,
             head_ref,
             head_sha,
+            independent_binding,
             evidence["workflow_id"],
             evidence["name"],
             evidence["path"],
@@ -1171,6 +1290,18 @@ def require_governed_main(
         )
         head_sha = pull_evidence["head_revision"]
         head_ref = pull_evidence["head_ref"]
+        head_associated_url = (
+            f"{api_root}/repos/{repository}/commits/{head_sha}/pulls"
+        )
+        head_associated = _complete_list_inventory(
+            head_associated_url, token, "pull-request head association"
+        )
+        independent_binding = _exact_head_pull_binding(
+            head_associated,
+            repository,
+            expected_repository_id,
+            pull_evidence,
+        )
         query = urllib.parse.urlencode(
             {"event": "pull_request", "head_sha": head_sha}
         )
@@ -1188,6 +1319,7 @@ def require_governed_main(
             before_sha,
             head_ref,
             head_sha,
+            independent_binding,
         )
         boundary, _ = _require_boundary_workflow(
             workflow_runs,
@@ -1199,6 +1331,7 @@ def require_governed_main(
             before_sha,
             head_ref,
             head_sha,
+            independent_binding,
         )
         final_workflow_runs = _complete_object_inventory(
             workflow_runs_url, token, "workflow_runs", "final exact-head workflow-run"
@@ -1227,6 +1360,7 @@ def require_governed_main(
                 before_sha,
                 head_ref,
                 head_sha,
+                independent_binding,
                 workflow_id=workflow_id,
                 workflow_name=workflow_name,
                 workflow_path=workflow_path,
@@ -1247,6 +1381,7 @@ def require_governed_main(
                 before_sha,
                 head_ref,
                 head_sha,
+                independent_binding,
                 workflow,
             )
         final_pull = _request_json(
@@ -1262,6 +1397,23 @@ def require_governed_main(
         )
         if canonical_json(final_pull_evidence) != canonical_json(pull_evidence):
             raise ContractError("merged pull-request evidence changed during authorization")
+        final_head_associated = _complete_list_inventory(
+            head_associated_url, token, "final pull-request head association"
+        )
+        final_independent_binding = _exact_head_pull_binding(
+            final_head_associated,
+            repository,
+            expected_repository_id,
+            final_pull_evidence,
+        )
+        if (
+            canonical_json(final_head_associated) != canonical_json(head_associated)
+            or canonical_json(final_independent_binding)
+            != canonical_json(independent_binding)
+        ):
+            raise ContractError(
+                "pull-request head association changed during authorization"
+            )
         final_associated = _complete_list_inventory(
             associated_url, token, "final associated pull-request"
         )

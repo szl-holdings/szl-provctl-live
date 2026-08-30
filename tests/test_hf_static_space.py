@@ -196,6 +196,30 @@ def write_push_event(path: Path, source_sha: str = SOURCE_SHA) -> None:
     )
 
 
+def exact_merged_pull(repository: str, body: str | None = None) -> dict:
+    repository_id = MODULE.TARGET_REPOSITORY_IDS[repository]
+    return {
+        "id": 70,
+        "number": 7,
+        "state": "closed",
+        "merged": True,
+        "merged_at": "2026-08-10T00:00:00Z",
+        "merge_commit_sha": SOURCE_SHA,
+        "merged_by": {"login": "solo-owner"},
+        "body": exact_pr_body(repository) if body is None else body,
+        "base": {
+            "ref": "main",
+            "sha": PARENT_SHA,
+            "repo": {"full_name": repository, "id": repository_id},
+        },
+        "head": {
+            "ref": "release-candidate",
+            "sha": PR_HEAD_SHA,
+            "repo": {"full_name": repository, "id": repository_id},
+        },
+    }
+
+
 def guard_responder(
     *,
     boundary_conclusion: str = "success",
@@ -204,8 +228,11 @@ def guard_responder(
     stale_boundary_success: bool = False,
     stale_check_success: bool = False,
     misbound_boundary: bool = False,
+    empty_workflow_pull_projection: bool = False,
     associated_pages: list[list[dict]] | None = None,
     associated_second_pages: list[list[dict]] | None = None,
+    head_associated_pages: list[list[dict]] | None = None,
+    head_associated_second_pages: list[list[dict]] | None = None,
     initial_body: str | None = None,
     final_body: str | None = None,
     release_attempt: int = 1,
@@ -222,28 +249,10 @@ def guard_responder(
     branch_calls = 0
     pull_calls = 0
     associated_scan = -1
+    head_associated_scan = -1
 
     def full_pull(pull_body: str) -> dict:
-        return {
-            "id": 70,
-            "number": 7,
-            "state": "closed",
-            "merged": True,
-            "merged_at": "2026-08-10T00:00:00Z",
-            "merge_commit_sha": SOURCE_SHA,
-            "merged_by": {"login": "solo-owner"},
-            "body": pull_body,
-            "base": {
-                "ref": "main",
-                "sha": PARENT_SHA,
-                "repo": {"full_name": repository, "id": repository_id},
-            },
-            "head": {
-                "ref": "release-candidate",
-                "sha": PR_HEAD_SHA,
-                "repo": {"full_name": repository, "id": repository_id},
-            },
-        }
+        return exact_merged_pull(repository, pull_body)
 
     def run_pull(number: int = 7) -> dict:
         return {
@@ -283,7 +292,9 @@ def guard_responder(
             "run_attempt": attempt,
             "check_suite_id": check_suite_id,
             "repository": {"full_name": repository, "id": repository_id},
-            "pull_requests": [run_pull(pull_number)],
+            "pull_requests": (
+                [] if empty_workflow_pull_projection else [run_pull(pull_number)]
+            ),
         }
 
     def release_run(attempt: int = release_attempt) -> dict:
@@ -387,9 +398,13 @@ def guard_responder(
         associated_pages = [[copy.deepcopy(initial_pull)]]
     if associated_second_pages is None:
         associated_second_pages = copy.deepcopy(associated_pages)
+    if head_associated_pages is None:
+        head_associated_pages = [[copy.deepcopy(initial_pull)]]
+    if head_associated_second_pages is None:
+        head_associated_second_pages = copy.deepcopy(head_associated_pages)
 
     def respond(url: str, token: str = "") -> object:
-        nonlocal associated_scan, branch_calls, pull_calls
+        nonlocal associated_scan, branch_calls, head_associated_scan, pull_calls
         if token != "github-test-token":
             raise AssertionError("guard omitted its GitHub credential")
         parsed = urllib.parse.urlparse(url)
@@ -409,6 +424,16 @@ def guard_responder(
             if page == 1:
                 associated_scan += 1
             pages = associated_pages if associated_scan == 0 else associated_second_pages
+            return copy.deepcopy(pages[page - 1] if page <= len(pages) else [])
+        if path == f"/repos/{repository}/commits/{PR_HEAD_SHA}/pulls":
+            page = int(query.get("page", ["1"])[0])
+            if page == 1:
+                head_associated_scan += 1
+            pages = (
+                head_associated_pages
+                if head_associated_scan == 0
+                else head_associated_second_pages
+            )
             return copy.deepcopy(pages[page - 1] if page <= len(pages) else [])
         if path == f"/repos/{repository}/pulls/7":
             pull_calls += 1
@@ -651,6 +676,137 @@ class StaticSpaceContractTests(unittest.TestCase):
             )
             self.assertEqual(output_path.read_bytes(), MODULE.canonical_json(result))
             self.assertFalse(failure_path.exists())
+
+    def test_guard_authorizes_empty_workflow_projection_after_independent_binding(
+        self,
+    ) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    MODULE,
+                    "_request_json",
+                    side_effect=guard_responder(
+                        empty_workflow_pull_projection=True
+                    ),
+                ) as request_json:
+                    result = MODULE.require_governed_main(
+                        SOURCE_SHA,
+                        event_path,
+                        root / "authorization.json",
+                    )
+            head_association_path = (
+                f"/repos/{repository}/commits/{PR_HEAD_SHA}/pulls"
+            )
+            head_association_calls = [
+                call
+                for call in request_json.call_args_list
+                if urllib.parse.urlparse(call.args[0]).path == head_association_path
+            ]
+            self.assertEqual(len(head_association_calls), 2)
+            self.assertEqual(
+                result["release_workflow"]["head_revision"], PR_HEAD_SHA
+            )
+            self.assertEqual(
+                result["required_workflow"]["pull_request_number"], 7
+            )
+
+    def test_guard_rejects_ambiguous_mismatched_or_drifting_head_binding(
+        self,
+    ) -> None:
+        repository = MODULE.load_config()["source_repository"]
+        environment = {
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_TOKEN": "github-test-token",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+        exact = exact_merged_pull(repository)
+        ambiguous = copy.deepcopy(exact)
+        ambiguous.update({"id": 71, "number": 8})
+        wrong_base = copy.deepcopy(exact)
+        wrong_base["base"]["sha"] = TARGET_SHA
+        wrong_head = copy.deepcopy(exact)
+        wrong_head["head"]["sha"] = TARGET_SHA
+        wrong_repository = copy.deepcopy(exact)
+        wrong_repository["head"]["repo"]["id"] += 1
+        later_drift = copy.deepcopy(exact)
+        later_drift["title"] = "association changed after workflow authorization"
+        variants = [
+            (
+                "ambiguous head association",
+                guard_responder(
+                    empty_workflow_pull_projection=True,
+                    head_associated_pages=[[exact, ambiguous]],
+                ),
+                "not bound to one unambiguous pull request",
+            ),
+            (
+                "base drift",
+                guard_responder(
+                    empty_workflow_pull_projection=True,
+                    head_associated_pages=[[wrong_base]],
+                ),
+                "head association is not exact",
+            ),
+            (
+                "head drift",
+                guard_responder(
+                    empty_workflow_pull_projection=True,
+                    head_associated_pages=[[wrong_head]],
+                ),
+                "head association is not exact",
+            ),
+            (
+                "repository drift",
+                guard_responder(
+                    empty_workflow_pull_projection=True,
+                    head_associated_pages=[[wrong_repository]],
+                ),
+                "head association is not exact",
+            ),
+            (
+                "association snapshot drift",
+                guard_responder(
+                    empty_workflow_pull_projection=True,
+                    head_associated_pages=[[exact]],
+                    head_associated_second_pages=[[later_drift]],
+                ),
+                "head association changed during authorization",
+            ),
+            (
+                "nonempty workflow projection mismatch",
+                guard_responder(misbound_boundary=True),
+                "exact required release-boundary workflow did not run",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            write_push_event(event_path)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                for label, responder, diagnostic in variants:
+                    with self.subTest(label=label):
+                        with mock.patch.object(
+                            MODULE, "_request_json", side_effect=responder
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.ContractError, diagnostic
+                            ):
+                                MODULE.require_governed_main(
+                                    SOURCE_SHA,
+                                    event_path,
+                                    root / f"{label}.json",
+                                )
 
     def test_guard_rejects_direct_push_and_spoofed_required_evidence(self) -> None:
         repository = MODULE.load_config()["source_repository"]
